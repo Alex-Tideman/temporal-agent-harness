@@ -211,10 +211,10 @@ async def _start(
     return handle
 
 
-async def _send(handle, text: str, expected_turn: int) -> None:
-    await handle.execute_update(
+async def _send(handle, text: str) -> AgentMessageReply:
+    return await handle.execute_update(
         SEND_AGENT_MESSAGE_UPDATE,
-        AgentMessage(type="act", payload={"text": text}, expected_turn=expected_turn),
+        AgentMessage(type="act", payload={"text": text}),
         result_type=AgentMessageReply,
     )
 
@@ -247,7 +247,7 @@ def _types_for(events: list[AgentEvent], tool_id: str) -> list[str]:
 
 def _reply_text(events: list[AgentEvent]) -> str:
     # The probes reply with TextReply(text=...), so the reply's output dict carries `text`.
-    reply = next(e.event for e in events if e.event.type == AgentEventType.REPLY)
+    reply = next(e.event for e in events if e.event.type == AgentEventType.MESSAGE_HANDLER_END)
     return reply.output["text"]
 
 
@@ -259,7 +259,7 @@ def _reply_text(events: list[AgentEvent]) -> str:
 async def test_approved_tool_executes_after_approval(env_and_client):
     client, task_queue = env_and_client
     handle = await _start(client, task_queue)
-    await _send(handle, "single", expected_turn=1)
+    await _send(handle, "single")
     agent_client = AgentClient(client, handle.id)
 
     events: list[AgentEvent] = []
@@ -293,10 +293,59 @@ async def test_approved_tool_executes_after_approval(env_and_client):
     assert _reply_text(events) == "act:S"
 
 
+async def test_every_event_of_a_dispatch_carries_its_message_id(env_and_client):
+    """Envelope-side attribution, end to end — the point of putting ``message_id`` there.
+
+    A gated ACTIVITY tool exercises every publisher at once: the workflow (approval requested,
+    tool lifecycle), the update handler resolving the gate from OUTSIDE the participant, and
+    the activity, which publishes across a process boundary where a ContextVar cannot reach.
+    All three must stamp the same id, and only the two turn brackets may be unattributed.
+    """
+    client, task_queue = env_and_client
+    handle = await _start(client, task_queue)
+    reply = await _send(handle, "single")
+    agent_client = AgentClient(client, handle.id)
+
+    events: list[AgentEvent] = []
+    async with asyncio.timeout(30):
+        async for item in _subscribe(client, handle.id):
+            ev = item.data
+            events.append(ev)
+            if (
+                ev.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED
+                and ev.event.tool_id == "g1"
+            ):
+                await agent_client.approve_tool("g1", approved=True)
+            if ev.event.type == AgentEventType.TURN_END:
+                break
+
+    assert reply.message_id
+    brackets = {AgentEventType.TURN_STARTED, AgentEventType.TURN_END}
+    for ev in events:
+        expected = None if ev.event.type in brackets else reply.message_id
+        assert ev.message_id == expected, ev.event.type
+
+    # Not a vacuous pass: the interesting publishers really are in there.
+    seen = {e.event.type for e in events}
+    assert {
+        AgentEventType.MESSAGE_ACCEPTED,
+        AgentEventType.MESSAGE_HANDLER_START,
+        AgentEventType.TOOL_APPROVAL_REQUESTED,
+        # Published by the ``tool_approval`` UPDATE handler, which is in no participant task —
+        # it reads the id off the approval entry, so a policy cascade resolving several calls
+        # attributes each to the message that made it.
+        AgentEventType.TOOL_APPROVAL_RESOLVED,
+        # Published from inside the activity, via TurnStreamContext.
+        AgentEventType.TOOL_START,
+        AgentEventType.TOOL_END,
+        AgentEventType.MESSAGE_HANDLER_END,
+    } <= seen
+
+
 async def test_denied_tool_does_not_execute(env_and_client):
     client, task_queue = env_and_client
     handle = await _start(client, task_queue)
-    await _send(handle, "single", expected_turn=1)
+    await _send(handle, "single")
     agent_client = AgentClient(client, handle.id)
 
     events: list[AgentEvent] = []
@@ -340,7 +389,7 @@ async def test_inherently_safe_tool_auto_approves_under_allow_safe(env_and_clien
         task_queue,
         config=AgentConfig(approval_policy=ToolApprovalPolicy.allow_inherently_safe()),
     )
-    await _send(handle, "safe", expected_turn=1)
+    await _send(handle, "safe")
     events = await _drain_to_turn_end(client, handle.id)
 
     assert _types_for(events, "s1") == [
@@ -354,7 +403,7 @@ async def test_always_require_gates_even_inherently_safe(env_and_client):
     """The safe-by-default baseline gates even an inherently-safe tool (step-through)."""
     client, task_queue = env_and_client
     handle = await _start(client, task_queue)  # default = always_require_approvals
-    await _send(handle, "safe", expected_turn=1)
+    await _send(handle, "safe")
     agent_client = AgentClient(client, handle.id)
 
     events: list[AgentEvent] = []
@@ -389,7 +438,7 @@ async def test_allow_listed_tool_auto_approves(env_and_client):
             approval_policy=ToolApprovalPolicy.allow_tools(["gated_activity_tool"])
         ),
     )
-    await _send(handle, "single", expected_turn=1)
+    await _send(handle, "single")
     events = await _drain_to_turn_end(client, handle.id)
 
     assert _types_for(events, "g1") == [
@@ -407,7 +456,7 @@ async def test_dangerously_skip_all_auto_approves(env_and_client):
         task_queue,
         config=AgentConfig(approval_policy=ToolApprovalPolicy.dangerously_skip_all()),
     )
-    await _send(handle, "single", expected_turn=1)
+    await _send(handle, "single")
     events = await _drain_to_turn_end(client, handle.id)
 
     assert _types_for(events, "g1") == [
@@ -431,7 +480,7 @@ async def test_config_policy_overrides_agent_default(env_and_client):
     assert status.approval_policy == ToolApprovalPolicy.dangerously_skip_all()
     assert status.has_custom_approval_fallback is False
 
-    await _send(handle, "single", expected_turn=1)
+    await _send(handle, "single")
     events = await _drain_to_turn_end(client, handle.id)
     assert AgentEventType.TOOL_APPROVAL_REQUESTED not in _types_for(events, "g1")
     assert _reply_text(events) == "act:S"
@@ -447,7 +496,7 @@ async def test_custom_fallback_approves_what_policy_did_not(env_and_client):
     agent_client = AgentClient(client, handle.id)
     assert (await agent_client.get_status()).has_custom_approval_fallback is True
 
-    await _send(handle, "single", expected_turn=1)
+    await _send(handle, "single")
     events = await _drain_to_turn_end(client, handle.id)
     assert _types_for(events, "g1") == [
         AgentEventType.TOOL_START,
@@ -467,7 +516,7 @@ async def test_remember_allowlists_tool_and_cascades_to_pending(env_and_client):
     decision — and the live policy now lists the tool (so future calls skip the gate)."""
     client, task_queue = env_and_client
     handle = await _start(client, task_queue)
-    await _send(handle, "concurrent", expected_turn=1)
+    await _send(handle, "concurrent")
     agent_client = AgentClient(client, handle.id)
 
     requested: set[str] = set()
@@ -523,7 +572,7 @@ async def test_remember_resolution_is_causally_ordered_before_cascade(env_and_cl
     order follows the order decisions are made, not gate registration/wake order."""
     client, task_queue = env_and_client
     handle = await _start(client, task_queue)
-    await _send(handle, "concurrent", expected_turn=1)
+    await _send(handle, "concurrent")
     agent_client = AgentClient(client, handle.id)
 
     requested: set[str] = set()
@@ -556,7 +605,7 @@ async def test_remember_resolution_is_causally_ordered_before_cascade(env_and_cl
 async def test_pending_approval_visible_in_status(env_and_client):
     client, task_queue = env_and_client
     handle = await _start(client, task_queue)
-    await _send(handle, "single", expected_turn=1)
+    await _send(handle, "single")
     agent_client = AgentClient(client, handle.id)
 
     async with asyncio.timeout(30):
@@ -580,7 +629,7 @@ async def test_pending_approval_visible_in_status(env_and_client):
 async def test_approval_is_idempotent(env_and_client):
     client, task_queue = env_and_client
     handle = await _start(client, task_queue)
-    await _send(handle, "single", expected_turn=1)
+    await _send(handle, "single")
     agent_client = AgentClient(client, handle.id)
 
     async with asyncio.timeout(30):
@@ -606,7 +655,7 @@ async def test_approval_is_idempotent(env_and_client):
 async def test_concurrent_first_approved_executes_first(env_and_client):
     client, task_queue = env_and_client
     handle = await _start(client, task_queue)
-    await _send(handle, "concurrent", expected_turn=1)
+    await _send(handle, "concurrent")
     agent_client = AgentClient(client, handle.id)
 
     # Both act-A and act-B are requested. Approve B first; only approve A once B has
@@ -645,7 +694,7 @@ async def test_concurrent_first_approved_executes_first(env_and_client):
 async def test_close_while_pending_auto_denies(env_and_client):
     client, task_queue = env_and_client
     handle = await _start(client, task_queue)
-    await _send(handle, "single", expected_turn=1)
+    await _send(handle, "single")
 
     pre_close: list[AgentEvent] = []
     async with asyncio.timeout(30):
@@ -669,7 +718,7 @@ async def test_close_while_pending_auto_denies(env_and_client):
 async def test_inline_workflow_tool_gates(env_and_client):
     client, task_queue = env_and_client
     handle = await _start(client, task_queue)
-    await _send(handle, "workflow-tool", expected_turn=1)
+    await _send(handle, "workflow-tool")
     agent_client = AgentClient(client, handle.id)
 
     events: list[AgentEvent] = []
