@@ -129,13 +129,14 @@ async def test_command_environment_excludes_provider_credentials(repo, monkeypat
         argv=[
             "python3",
             "-c",
-            "import os; print(os.environ.get('OPENAI_API_KEY','absent')); print(os.environ['HOME'])",
+            "import os; print(os.environ.get('OPENAI_API_KEY','absent')); print(os.environ['HOME']); print(os.environ['PYTHONDONTWRITEBYTECODE'])",
         ],
     ).model_dump()
     result = await perform(repo.name, "env-check", action)
     assert result["exit_code"] == 0
     assert "fake-test-secret" not in result["output"]
     assert "absent" in result["output"] and "command-homes" in result["output"]
+    assert result["output"].rstrip().endswith("1")
 
 
 def test_archive_never_rolls_back_newer_state(root):

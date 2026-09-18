@@ -36,6 +36,7 @@ export interface State {
   repair_attempt?: number;
   host_calls?: number;
   acceptance_note?: string;
+  project_merge?: ProjectMerge | null;
   actors?: {
     id: string;
     role: string;
@@ -133,6 +134,19 @@ export interface Task {
       value: { turns: ConversationTurn[]; context_shortened: boolean };
     };
   } | null;
+}
+export interface ProjectMerge {
+  ok: boolean;
+  operation_id: string;
+  base_revision: string;
+  revision: string;
+  files: string[];
+  applied_files: string[];
+  already_present_files: string[];
+  already_applied: boolean;
+  project_path: string;
+  branch: string;
+  merged_at: number;
 }
 export interface ConversationTurn {
   number: number;

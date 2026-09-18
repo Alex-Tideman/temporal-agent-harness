@@ -136,6 +136,30 @@ class ToolCall(BaseModel):
     output_tokens: int = 0
 
 
+class ProjectMergeReceipt(HarnessState):
+    """Durable workflow receipt for a project working-tree merge."""
+
+    ok: bool = True
+    operation_id: str
+    base_revision: str
+    revision: str
+    files: list[str] = Field(default_factory=list)
+    applied_files: list[str] = Field(default_factory=list)
+    already_present_files: list[str] = Field(default_factory=list)
+    already_applied: bool = False
+    project_path: str
+    branch: str
+    merged_at: float
+
+
+class ProjectMergeResult(BaseModel):
+    """Activity result kept separate from lifecycle authorization."""
+
+    ok: bool = True
+    error: str = ""
+    receipt: ProjectMergeReceipt | None = None
+
+
 class HostRequest(BaseModel):
     """A child request with assignment and deterministic request identity."""
 
@@ -188,7 +212,7 @@ class Evidence(Check):
 
 
 class CodingState(SdlcState):
-    schema_version: int = 3
+    schema_version: int = 4
     engine: str = "v2"
     blueprints: list[Blueprint] = Field(default_factory=list)
     actors: list[Actor] = Field(default_factory=list)
@@ -201,3 +225,4 @@ class CodingState(SdlcState):
     host_calls: int = 0
     checks: list[Evidence] = Field(default_factory=list)
     acceptance_note: str = ""
+    project_merge: ProjectMergeReceipt | None = None

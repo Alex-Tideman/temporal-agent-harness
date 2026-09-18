@@ -26,6 +26,7 @@
     AlertCircle,
     Bell,
     Brain,
+    GitMerge,
     Search,
     Trash2,
   } from "@lucide/svelte";
@@ -35,6 +36,7 @@
     type Home,
     type Task,
     type Project,
+    type ProjectMerge,
     type ProviderCheck,
     type MessageDraft,
     type MessageReceipt,
@@ -55,6 +57,10 @@
   let removeWorkspace = $state(false);
   let deleting = $state(false);
   let deleteError = $state("");
+  let mergeDialog = $state<HTMLDialogElement>();
+  let mergeTarget = $state<Task | null>(null);
+  let merging = $state(false);
+  let mergeError = $state("");
   let locked = $state(false);
   let unlockToken = $state("");
   let projectId = $state("");
@@ -173,6 +179,16 @@
   let project = $derived(
     home?.projects.find((p) => p.id === active?.project_id),
   );
+  let mergeProject = $derived(
+    home?.projects.find((p) => p.id === mergeTarget?.project_id),
+  );
+  let projectMergeCurrent = $derived(
+    Boolean(
+      progress?.project_merge &&
+      progress?.revision &&
+      progress.project_merge.revision === progress.revision,
+    ),
+  );
   let filteredTasks = $derived(
     home?.tasks.filter((t) =>
       (t.title + t.project_name).toLowerCase().includes(query.toLowerCase()),
@@ -199,6 +215,7 @@
       running: "Working",
       review: "Ready for review",
       accepted: "Accepted",
+      merging: "Merging",
       paused: "Paused",
       failed: "Needs attention",
       cancelled: "Stopped",
@@ -269,6 +286,48 @@
     removeWorkspace = false;
     deleteError = "";
     deleteDialog?.showModal();
+  }
+  function confirmMerge() {
+    if (
+      !active ||
+      !active.live ||
+      progress?.status !== "accepted" ||
+      (progress.mode ?? active.mode) !== "change"
+    )
+      return;
+    mergeTarget = active;
+    mergeError = "";
+    if (!mergeDialog?.open) mergeDialog?.showModal();
+  }
+  function closeMergeDialog() {
+    merging = false;
+    if (mergeDialog?.open) mergeDialog.close();
+    mergeTarget = null;
+    mergeError = "";
+  }
+  async function mergeTask() {
+    if (!mergeTarget || merging) return;
+    const identity = mergeTarget.id;
+    merging = true;
+    mergeError = "";
+    try {
+      const result = await api<ProjectMerge>(
+        "/tasks/" + identity + "/merge",
+        "POST",
+      );
+      closeMergeDialog();
+      const count = result.files.length;
+      toast = result.already_applied
+        ? "These task changes are already present in " +
+          result.project_path +
+          "."
+        : `Merged ${count} ${count === 1 ? "file" : "files"} into ${result.project_path} on ${result.branch}. The changes are uncommitted.`;
+      await refresh();
+    } catch (e) {
+      mergeError = (e as Error).message;
+    } finally {
+      merging = false;
+    }
   }
   async function deleteTask() {
     if (!deleteTarget || deleting) return;
@@ -1286,7 +1345,20 @@
               </div>
             </div>
             <div class="task-controls">
-              {#if progress?.status === "running"}<button
+              {#if active.engine === "v2" && progress?.status === "accepted" && (progress.mode ?? active.mode) === "change" && active.workspace}
+                {#if projectMergeCurrent}<button
+                    disabled
+                    title={"Merged into " +
+                      progress.project_merge?.project_path}
+                    ><Check size={14} /> Merged into project</button
+                  >{:else}<button
+                    class="primary"
+                    disabled={busy || !active.live}
+                    onclick={confirmMerge}
+                    title="Write the accepted changes into the project checkout"
+                    ><GitMerge size={14} /> Merge into project</button
+                  >{/if}
+              {/if}{#if progress?.status === "running"}<button
                   disabled={busy}
                   onclick={() => control("pause")}
                   ><Pause size={14} /> Pause</button
@@ -1878,6 +1950,43 @@
     </div>
   </div>
 {/if}
+
+<dialog
+  class="delete-dialog merge-dialog"
+  bind:this={mergeDialog}
+  aria-labelledby="merge-task-title"
+  aria-describedby="merge-task-description"
+  oncancel={(event) => {
+    if (merging) event.preventDefault();
+  }}
+  onclose={() => {
+    mergeTarget = null;
+    mergeError = "";
+  }}
+>
+  <h2 id="merge-task-title">Merge into project?</h2>
+  <p class="delete-task-name">{mergeTarget?.title}</p>
+  <p id="merge-task-description">
+    This writes the accepted task changes into the working tree at:
+  </p>
+  {#if mergeProject?.path}<code class="workspace-path">{mergeProject.path}</code
+    >{/if}
+  <p class="delete-note">
+    boltzmann will not create a commit or push. Existing project edits are
+    preserved when the changes apply cleanly. Overlapping edits stop the merge
+    without changing the project.
+  </p>
+  {#if fileText !== originalText}<p class="delete-note">
+      Unsaved text in the task file editor is not part of the accepted changes.
+    </p>{/if}
+  {#if mergeError}<p class="delete-error" role="alert">{mergeError}</p>{/if}
+  <div class="dialog-actions">
+    <button disabled={merging} onclick={closeMergeDialog}>Cancel</button>
+    <button class="primary" disabled={merging} onclick={mergeTask}>
+      <GitMerge size={14} />{merging ? "Merging…" : "Merge changes"}
+    </button>
+  </div>
+</dialog>
 
 <dialog
   class="delete-dialog"

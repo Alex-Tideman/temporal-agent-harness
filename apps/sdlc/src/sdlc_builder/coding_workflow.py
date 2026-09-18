@@ -40,7 +40,7 @@ with workflow.unsafe.imports_passed_through():
         ToolResult,
     )
     from .coding_tools import coding_tools
-    from .coding_workspace import coding_operation
+    from .coding_workspace import coding_operation, project_merge_operation
     from .conversations import recent_context
     from .failures import FAILURE_TYPE, workflow_failure
     from .integrations import integration_for
@@ -231,6 +231,76 @@ class CodingWorkflow(SdlcAgentWorkflow):
             with self.state.mutate() as state:
                 state.verification = "stale"
         return result
+
+    @workflow.update
+    async def merge_project(self) -> dict:
+        """Durably merge the accepted revision into its configured checkout."""
+        async with self.lock:
+            current = self.state.current
+            if current.status != "accepted":
+                return {
+                    "ok": False,
+                    "error": "Accept the current task revision before merging it",
+                }
+            if current.mode != "change":
+                return {
+                    "ok": False,
+                    "error": "Read-only tasks have no changes to merge",
+                }
+            if not current.revision:
+                return {
+                    "ok": False,
+                    "error": "The accepted task has no source revision. Refresh and accept it again before merging.",
+                }
+            previous = current.project_merge
+            if previous and previous.revision == current.revision:
+                return previous.model_dump(mode="json")
+
+            accepted_revision = current.revision
+            operation_id = workflow.uuid4().hex
+            prior_focus, prior_next_action = current.focus, current.next_action
+            with self.state.mutate() as state:
+                state.status = "merging"
+                state.focus = "Merging accepted changes into the project"
+                state.next_action = "Waiting for the durable merge activity"
+            try:
+                result = await workflow.execute_activity(
+                    project_merge_operation,
+                    args=[
+                        self.current_task.task_id,
+                        operation_id,
+                        accepted_revision,
+                    ],
+                    start_to_close_timeout=timedelta(minutes=10),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+            except Exception as error:
+                with self.state.mutate() as state:
+                    state.status = "accepted"
+                    state.focus = prior_focus
+                    state.next_action = prior_next_action
+                return {
+                    "ok": False,
+                    "error": "The durable merge activity failed. "
+                    + workflow_failure(error, "tool").title,
+                }
+            if not result.ok or result.receipt is None:
+                with self.state.mutate() as state:
+                    state.status = "accepted"
+                    state.focus = prior_focus
+                    state.next_action = prior_next_action
+                return {
+                    "ok": False,
+                    "error": result.error or "The merge activity returned no receipt",
+                }
+            with self.state.mutate() as state:
+                state.status = "accepted"
+                state.focus = "Merged into project"
+                state.next_action = (
+                    "Commit the project changes when ready, or send a follow-up"
+                )
+                state.project_merge = result.receipt
+            return result.receipt.model_dump(mode="json")
 
     def observe_revision(self, revision: str):
         with self.state.mutate() as state:
@@ -520,9 +590,8 @@ class CodingWorkflow(SdlcAgentWorkflow):
                 break  # No silently inherited permission for changed scripts/config.
         return evidence
 
-    async def run_turn(
-        self, task: TaskInput, *, initial: bool, message_id: str = "initial"
-    ) -> TextReply:
+    def begin_turn(self, task: TaskInput, message_id: str) -> list[dict[str, str]]:
+        """Transition into a turn while holding the workspace-operation lock."""
         self.current_task = task
         self.paused = self.cancelled = False
         self.response = None
@@ -564,6 +633,7 @@ class CodingWorkflow(SdlcAgentWorkflow):
                 "",
                 "",
             )
+            state.project_merge = None
             state.repair_attempt = 0
             state.steps = (
                 [
@@ -582,6 +652,15 @@ class CodingWorkflow(SdlcAgentWorkflow):
                     Step(id="review", title="Answer"),
                 ]
             )
+        return history
+
+    async def run_turn(
+        self, task: TaskInput, *, initial: bool, message_id: str = "initial"
+    ) -> TextReply:
+        # A follow-up admitted while a merge activity is running waits until the
+        # accepted revision and its project receipt have settled.
+        async with self.lock:
+            history = self.begin_turn(task, message_id)
         self.entry(workflow.uuid4().hex, "you", task.prompt)
         try:
             self.stage("inspect")

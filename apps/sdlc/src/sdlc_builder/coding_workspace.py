@@ -1,16 +1,28 @@
 """V2 execution receipts. No provider credentials or lifecycle decisions live here."""
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
+import re
+import subprocess
+import time
 from pathlib import Path
 
 from temporalio import activity
 
 from . import workspaces as ws
-from .coding_models import FileChange, FileView, SearchHit, ToolCall, ToolResult
-from .store import data_dir, workspace
+from .coding_models import (
+    FileChange,
+    FileView,
+    ProjectMergeReceipt,
+    ProjectMergeResult,
+    SearchHit,
+    ToolCall,
+    ToolResult,
+)
+from .store import Store, data_dir, workspace
 
 
 def revision(root: Path) -> str:
@@ -90,6 +102,112 @@ def save_record(record: Path, value: dict):
         file.flush()
         os.fsync(file.fileno())
     temp.replace(record)
+
+
+def merge_project(
+    task_id: str,
+    operation_id: str,
+    expected_revision: str,
+) -> ProjectMergeResult:
+    """Journal and serialize one idempotent merge into a project checkout."""
+    root = workspace(task_id)
+    if len(operation_id) > 128 or not operation_id.replace("-", "").isalnum():
+        return ProjectMergeResult(ok=False, error="Invalid operation ID")
+    if not re.fullmatch(r"[a-f0-9]{64}", expected_revision):
+        return ProjectMergeResult(ok=False, error="Invalid accepted revision")
+
+    journal = data_dir() / "project-merge-operations" / task_id
+    journal.mkdir(parents=True, exist_ok=True, mode=0o700)
+    operation_lock_path = journal / f"{operation_id}.lock"
+    operation_lock_path.touch(mode=0o600, exist_ok=True)
+    # Concurrent delivery of the same activity must share one journal writer.
+    with operation_lock_path.open("r+") as operation_lock:
+        fcntl.flock(operation_lock.fileno(), fcntl.LOCK_EX)
+        record = journal / f"{operation_id}.json"
+        previous = json.loads(record.read_text()) if record.exists() else {}
+        if previous:
+            if previous["expected_revision"] != expected_revision:
+                return ProjectMergeResult(
+                    ok=False,
+                    error="Operation ID reused with different merge arguments",
+                )
+            if "result" in previous:
+                return ProjectMergeResult.model_validate(previous["result"])
+            source_root = Path(previous["project_path"])
+            base_revision = previous["base_revision"]
+            entry = previous
+        else:
+            try:
+                store = Store()
+                task = store.get("tasks", task_id)
+                if task.get("engine") != "v2":
+                    raise ValueError("Only Coding V2 tasks support project merge")
+                base_revision = task.get("base_commit", "")
+                if not re.fullmatch(r"[a-f0-9]{40,64}", base_revision):
+                    raise ValueError(
+                        "This task has no valid base commit. Inspect its workspace locally."
+                    )
+                project = store.get("projects", task["project_id"])
+                source_root = Path(project["path"]).expanduser().resolve()
+            except (KeyError, ValueError, OSError) as error:
+                return ProjectMergeResult(ok=False, error=str(error)[:1000])
+            entry = {
+                "expected_revision": expected_revision,
+                "project_path": str(source_root),
+                "base_revision": base_revision,
+            }
+            save_record(record, entry)
+
+        lock_root = data_dir() / "project-merge-locks"
+        lock_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_name = hashlib.sha256(str(source_root).encode()).hexdigest() + ".lock"
+        lock_path = lock_root / lock_name
+        lock_path.touch(mode=0o600, exist_ok=True)
+
+        # Temporal may retry an activity after its worker disappears. The OS lock
+        # serializes retries and other tasks targeting this same project checkout.
+        with lock_path.open("r+") as project_lock:
+            fcntl.flock(project_lock.fileno(), fcntl.LOCK_EX)
+            try:
+                merged = ws.merge_to_project(
+                    root,
+                    base_revision,
+                    str(source_root),
+                    expected_revision,
+                )
+                result = ProjectMergeResult(
+                    receipt=ProjectMergeReceipt(
+                        operation_id=operation_id,
+                        base_revision=base_revision,
+                        merged_at=time.time(),
+                        **merged,
+                    )
+                )
+            except (
+                ValueError,
+                OSError,
+                UnicodeError,
+                subprocess.SubprocessError,
+            ) as error:
+                result = ProjectMergeResult(ok=False, error=str(error)[:1000])
+            entry["result"] = result.model_dump(mode="json")
+            save_record(record, entry)
+            return result
+
+
+@activity.defn
+async def project_merge_operation(
+    task_id: str,
+    operation_id: str,
+    expected_revision: str,
+) -> ProjectMergeResult:
+    """Apply an accepted revision as a retry-safe Temporal activity."""
+    return await asyncio.to_thread(
+        merge_project,
+        task_id,
+        operation_id,
+        expected_revision,
+    )
 
 
 @activity.defn

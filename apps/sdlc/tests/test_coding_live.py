@@ -391,6 +391,20 @@ def test_coding_v2_lifecycle(tmp_path):
         assert len(corrected["snapshot"]["conversation"]["value"]["turns"]) == 3
         assert len(corrected["snapshot"]["value"]["blueprints"]) == 2
         assert not client.get(path + "/review").json()["comments"][0]["resolved"]
+        # Acceptance authorizes a workflow update; its retry-safe activity writes
+        # the source checkout and the receipt survives worker/app restart.
+        post(path + "/control", {"command": "accept"})
+        merged = post(path + "/merge", {})
+        assert merged["files"] == ["feature-note.txt", "greeting.py"]
+        assert (Path(project["path"]) / "feature-note.txt").read_text() == (
+            "Greeting feature"
+        )
+        merged_state = read()["snapshot"]["value"]
+        assert merged_state["project_merge"]["operation_id"] == merged["operation_id"]
+        stop()
+        launch()
+        restored = read()["snapshot"]["value"]
+        assert restored["project_merge"] == merged_state["project_merge"]
         # A claimed review without source inspection cannot turn real passing
         # checks into verified completion, even when the model says "verified".
         false_profile = post(

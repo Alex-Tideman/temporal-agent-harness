@@ -40,7 +40,7 @@ from . import reviews, workspaces
 from .activities import decide, workspace_action
 from .bounded_code import bounded_resume, bounded_start
 from .coding_workflow import WORKFLOW_NAME_V2, CodingRoleWorkflow, CodingWorkflow
-from .coding_workspace import coding_operation
+from .coding_workspace import coding_operation, project_merge_operation
 from .integrations import integration_for, profile_available, registered_integrations
 from .models import Control, FollowUpInput, Profile, TaskInput
 from .store import Store, data_dir, workspace
@@ -260,6 +260,7 @@ def create_app() -> FastAPI:
                     activities=[
                         decide,
                         coding_operation,
+                        project_merge_operation,
                         bounded_start,
                         bounded_resume,
                     ],
@@ -945,6 +946,39 @@ def create_app() -> FastAPI:
         async with task_locks.setdefault(identity, asyncio.Lock()):
             store.get("tasks", identity)
             return {"prompt": reviews.fix_prompt(store.review(identity), body)}
+
+    @app.post("/api/tasks/{identity}/merge")
+    async def merge_task_into_project(identity: str):
+        async with task_locks.setdefault(identity, asyncio.Lock()):
+            task = await get_task(identity)
+            if not task.get("live"):
+                raise HTTPException(
+                    503,
+                    "Reconnect boltzmann to Temporal before merging this task",
+                )
+            if task.get("pending_message"):
+                raise HTTPException(
+                    409, "Wait for message delivery before merging this task"
+                )
+            if task.get("engine") != "v2":
+                raise HTTPException(
+                    409,
+                    "Workflow-managed merge is available for Coding V2 tasks. Export this older task's patch instead.",
+                )
+            handle = app.state.client.get_workflow_handle(task["workflow_id"])
+            result = await handle.execute_update("merge_project")
+            if not result["ok"]:
+                raise HTTPException(409, result["error"])
+            # Make the workflow-owned receipt visible immediately when possible.
+            # A failed refresh does not turn an already-completed merge into an error.
+            try:
+                store.archive(
+                    identity,
+                    await handle.query("progress", rpc_timeout=timedelta(seconds=3)),
+                )
+            except Exception:
+                pass
+            return result
 
     @app.get("/api/tasks/{identity}/patch")
     async def export_patch(identity: str):

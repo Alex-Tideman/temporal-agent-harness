@@ -533,6 +533,9 @@ kbd {
 .overview-heading {
   margin-bottom: 34px;
 }
+.overview-heading h1 {
+  color: var(--warning);
+}
 .overview h1 {
   margin-top: 13px;
 }
@@ -598,8 +601,7 @@ kbd {
   background: transparent;
 }
 .prompt-input:focus-visible {
-  outline: 2px solid var(--accent-border);
-  outline-offset: 4px;
+  outline: none;
 }
 .compose-options {
   display: flex;
@@ -1865,6 +1867,12 @@ button.danger:hover {
   }
   .task-controls {
     justify-content: flex-end;
+  }
+  .task-controls button {
+    min-height: 44px;
+  }
+  .task-controls .icon-button {
+    min-width: 44px;
   }
   .tabs {
     gap: 10px;

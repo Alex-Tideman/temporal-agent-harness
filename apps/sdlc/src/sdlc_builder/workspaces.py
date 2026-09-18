@@ -174,9 +174,8 @@ def prepare_workspace(source: str, task_id: str) -> dict:
     return {"workspace": str(root), "base_commit": base, "source_dirty": dirty}
 
 
-def diff(root: Path, base_revision: str = "HEAD") -> dict:
-    # Include untracked files without mutating the index; filter secrets even if tracked.
-    changed = []
+def diff_entries(root: Path, base_revision: str = "HEAD") -> list[tuple[str, str]]:
+    """Return one supported text patch per changed path."""
     output = []
     # Include files deleted by a later local commit when exporting from a task's
     # original base. Agent tools retain their existing HEAD comparison.
@@ -237,15 +236,145 @@ def diff(root: Path, base_revision: str = "HEAD") -> dict:
                 )
                 patch = result.stdout
             if patch:
-                changed.append(name)
-                output.append(patch)
+                output.append((name, patch))
         except (ValueError, UnicodeError):
             continue
-    patch = "".join(output)
+    return output
+
+
+def changed_paths(root: Path, base_revision: str) -> list[str]:
+    """List every tracked or untracked path changed from the task base."""
+    tracked = git(
+        root,
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--name-only",
+        "-z",
+        base_revision,
+        "--",
+    ).split("\0")
+    untracked = git(root, "ls-files", "-z", "--others", "--exclude-standard").split(
+        "\0"
+    )
+    return sorted({name for name in [*tracked, *untracked] if name})
+
+
+def diff(root: Path, base_revision: str = "HEAD") -> dict:
+    # Include untracked files without mutating the index; filter secrets even if tracked.
+    entries = diff_entries(root, base_revision)
+    patch = "".join(value for _, value in entries)
     return {
-        "files": changed,
+        "files": [name for name, _ in entries],
         "patch": patch[:500_000],
         "truncated": len(patch) > 500_000,
+    }
+
+
+def git_apply(root: Path, patch: str, *options: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            "git",
+            "--literal-pathspecs",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "apply",
+            "--whitespace=nowarn",
+            *options,
+            "--",
+        ],
+        cwd=root,
+        input=patch,
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+
+
+def merge_to_project(
+    root: Path,
+    base_revision: str,
+    source: str,
+    expected_revision: str = "",
+) -> dict:
+    """Apply an accepted task into its source checkout without staging or committing."""
+    # Imported lazily because coding_workspace uses these workspace primitives.
+    from .coding_workspace import revision
+
+    root = root.resolve()
+    source_root = Path(source).expanduser().resolve()
+    if source_root == root:
+        raise ValueError("The task workspace cannot be its own project checkout")
+    actual_root = Path(
+        git(source_root, "rev-parse", "--show-toplevel").strip()
+    ).resolve()
+    if actual_root != source_root:
+        raise ValueError("The configured project path is not the Git repository root")
+    git(source_root, "cat-file", "-e", f"{base_revision}^{{commit}}")
+
+    observed_revision = revision(root)
+    if expected_revision and observed_revision != expected_revision:
+        raise ValueError(
+            "The task workspace changed after acceptance. Review and accept the current revision before merging."
+        )
+    paths = changed_paths(root, base_revision)
+    entries = diff_entries(root, base_revision)
+    if revision(root) != observed_revision:
+        raise ValueError(
+            "The task workspace changed while preparing the merge. Review and accept it again."
+        )
+    if not paths:
+        raise ValueError("There are no task changes to merge into the project")
+    supported = {name for name, _ in entries}
+    if set(paths) != supported:
+        raise ValueError(
+            "Some task changes cannot be merged automatically. Inspect large, binary, linked, secret, or excluded files in the task workspace."
+        )
+    if sum(len(patch) for _, patch in entries) > 500_000:
+        raise ValueError(
+            "The task patch exceeds the 500 KB merge limit. Use Git in the task workspace."
+        )
+    for name in paths:
+        safe_path(source_root, name)
+
+    pending = []
+    already_present = []
+    for name, patch in entries:
+        if git_apply(source_root, patch, "--check").returncode == 0:
+            pending.append((name, patch))
+        elif git_apply(source_root, patch, "--check", "--reverse").returncode == 0:
+            already_present.append(name)
+        else:
+            raise ValueError(
+                "The project has overlapping changes in files from this task. Nothing was changed. Resolve those edits in the project, then try again."
+            )
+
+    combined = "".join(patch for _, patch in pending)
+    if combined:
+        # Check the combined patch too, then let git apply perform its own atomic
+        # preflight immediately before writing the working tree.
+        if git_apply(source_root, combined, "--check").returncode:
+            raise ValueError(
+                "The project changed while preparing the merge. Nothing was changed. Try again after reviewing the project checkout."
+            )
+        applied = git_apply(source_root, combined)
+        if applied.returncode:
+            raise ValueError(
+                "The project changed while the merge was starting. Git did not complete the merge; inspect the project checkout before retrying."
+            )
+
+    return {
+        "ok": True,
+        "revision": observed_revision,
+        "files": paths,
+        "applied_files": [name for name, _ in pending],
+        "already_present_files": already_present,
+        "already_applied": not pending,
+        "project_path": str(source_root),
+        "branch": git(source_root, "branch", "--show-current").strip()
+        or "detached HEAD",
     }
 
 
@@ -286,6 +415,7 @@ async def execute_check(root: Path, argv: list[str]) -> dict:
         "HOME": str(scratch),
         "TMPDIR": str(scratch),
         "LANG": "en_US.UTF-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONUNBUFFERED": "1",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
