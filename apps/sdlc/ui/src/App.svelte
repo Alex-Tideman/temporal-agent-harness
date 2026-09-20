@@ -55,7 +55,15 @@
   let workspaceProjects = $derived(
     home?.projects
       .filter((project) => !project.demo)
-      .sort((a, b) => (b.last_opened ?? 0) - (a.last_opened ?? 0)) ?? [],
+      .sort(
+        (a, b) =>
+          a.name.localeCompare(b.name, undefined, {
+            sensitivity: "base",
+            numeric: true,
+          }) ||
+          a.path.localeCompare(b.path) ||
+          a.id.localeCompare(b.id),
+      ) ?? [],
   );
   let configuredProfiles = $derived(
     home?.profiles.filter((profile) => profile.provider !== "demo") ?? [],
@@ -222,7 +230,9 @@
   );
   let filteredTasks = $derived(
     repositoryTasks.filter((t) =>
-      (t.title + t.project_name).toLowerCase().includes(query.toLowerCase()),
+      (t.title + " " + t.project_name)
+        .toLowerCase()
+        .includes(query.trim().toLowerCase()),
     ) ?? [],
   );
   let editable = $derived(
@@ -441,6 +451,7 @@
     active = null;
     composer = false;
     selectedRepositoryId = "";
+    query = "";
     parentTaskId = "";
     selectedFile = "";
     fileText = "";
@@ -915,53 +926,20 @@
       <div class="sidebar-label">
         Repositories <span>{workspaceProjects.length}</span>
       </div>
-      {#each workspaceProjects as item}
-        <button
-          class:project-selected={selectedRepositoryId === item.id}
-          class="project-row"
-          onclick={() => openRepository(item.id)}
-          ><FolderOpen size={15} /><span>{item.name}</span></button
-        >
-      {/each}
-      <button
-        class="text-button add-repo"
-        onclick={() => repositoryDialog?.show()}
-        ><Plus size={14} /> Add repository</button
-      >
-      <div class="sidebar-label tasks-label">
-        Tasks <span>{repositoryTasks.length}</span>
-      </div>
-      <div class="search-field">
-        <Search size={14} /><input
-          placeholder="Find a task…"
-          aria-label="Find a task"
-          bind:value={query}
-        />
-      </div>
-      <nav class="task-list" aria-label="Task history">
-        {#each filteredTasks as task}
+      <nav class="repository-nav" aria-label="Repositories">
+        {#each workspaceProjects as item (item.id)}
           <button
-            class:selected={active?.id === task.id && view === "workspace"}
-            class="task-item"
-            onclick={() => attempt(() => selectTask(task))}
+            class:project-selected={selectedRepositoryId === item.id}
+            class="project-row"
+            onclick={() => openRepository(item.id)}
+            ><FolderOpen size={15} /><span>{item.name}</span></button
           >
-            <span
-              class="task-dot"
-              class:attention={!!taskAttention(task)}
-              class:done={task.snapshot?.value.status === "accepted"}
-            ></span>
-            <span
-              ><strong>{task.title}</strong><small
-                >{task.project_name} <span>·</span>
-                {taskAttention(task) ||
-                  statusLabel(task.snapshot?.value.status)}</small
-              ></span
-            >
-          </button>
         {/each}
-        {#if !filteredTasks.length}<p class="sidebar-empty">
-            No tasks yet. Start a task to see its progress here.
-          </p>{/if}
+        <button
+          class="text-button add-repo"
+          onclick={() => repositoryDialog?.show()}
+          ><Plus size={14} /> Add repository</button
+        >
       </nav>
       <div class="sidebar-bottom">
         <button
@@ -1518,12 +1496,21 @@
               >
             </div>
             {#if repositoryTasks.length}
+              <div class="task-search">
+                <Search size={15} /><input
+                  placeholder="Find a task…"
+                  aria-label="Find a task"
+                  bind:value={query}
+                />
+              </div>
+            {/if}
+            {#if filteredTasks.length}
               <div class="task-table">
                 <div class="task-table-labels" aria-hidden="true">
                   <span>Task</span><span>Repository</span><span>Status</span
                   ><span></span>
                 </div>
-                {#each repositoryTasks.slice(0, 8) as task}
+                {#each filteredTasks as task (task.id)}
                   <button
                     class="task-table-row"
                     onclick={() => attempt(() => selectTask(task))}
@@ -1557,6 +1544,17 @@
                     <ChevronRight size={15} class="row-chevron" />
                   </button>
                 {/each}
+              </div>
+            {:else if query.trim() && repositoryTasks.length}
+              <div class="recent-empty">
+                <Search size={20} />
+                <div>
+                  <h3>No matching tasks</h3>
+                  <p>Try a different name or clear your search.</p>
+                </div>
+                <button class="text-button" onclick={() => (query = "")}
+                  >Clear search</button
+                >
               </div>
             {:else}
               <div class="recent-empty">

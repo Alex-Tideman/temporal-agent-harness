@@ -40,10 +40,8 @@
   let folderPurpose = $state<"repository" | "projects">("repository");
   let browseQuery = $state("");
   let generation = 0;
-  let recent = $derived(
-    projects
-      .filter((item) => matchesRepository(item, query))
-      .slice(0, query ? 100 : 5),
+  let connected = $derived(
+    projects.filter((item) => matchesRepository(item, query)),
   );
   let suggestions = $derived(
     discovery?.suggestions.filter(
@@ -284,13 +282,11 @@
       />
     </div>
     <div class="repository-dialog-results" aria-busy={loading}>
-      {#if recent.length}<section aria-label="Recent repositories">
+      {#if connected.length}<section aria-label="Connected repositories">
           <div class="repository-section-heading">
-            <span
-              >{query ? "Connected repositories" : "Recent repositories"}</span
-            >
+            <span>Connected repositories</span>
           </div>
-          {#each recent as project}<button
+          {#each connected as project}<button
               type="button"
               class="repository-option"
               disabled={!!busy}
@@ -364,7 +360,7 @@
             >
           </div>{/if}
       </section>
-      {#if query && !recent.length && !suggestions.length && !loading}<p
+      {#if query && !connected.length && !suggestions.length && !loading}<p
           class="repository-empty"
         >
           Can't find it? Choose its folder above.

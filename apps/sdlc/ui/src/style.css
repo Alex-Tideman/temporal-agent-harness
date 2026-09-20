@@ -593,82 +593,39 @@ kbd {
   margin: 4px 10px 4px;
   color: var(--text-3);
 }
-.tasks-label {
-  margin-top: 0;
+.repository-nav {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
-.search-field {
+.repository-nav > button {
+  flex-shrink: 0;
+}
+.task-search {
   display: flex;
   align-items: center;
-  color: var(--text-3);
-  padding: 0 8px;
-}
-.search-field input {
-  padding: 6px;
-  border: 0;
-  background: none;
-  font-size: 12px;
-  min-width: 0;
-}
-.task-list {
-  overflow-y: auto;
-  margin-top: 11px;
-  flex: 1;
-}
-.task-item {
-  border: 0;
-  background: none;
-  text-align: left;
-  width: 100%;
-  justify-content: flex-start;
-  align-items: flex-start;
-  padding: 12px 10px;
   gap: 8px;
-  line-height: 1.5;
+  margin-bottom: 14px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-3);
+  background: var(--surface-0);
 }
-.task-item.selected {
-  background: var(--surface-2);
-  box-shadow: inset 2px 0 var(--accent);
+.task-search:focus-within {
+  border-color: var(--accent-border);
 }
-.task-item > span:last-child {
+.task-search input {
   min-width: 0;
-}
-.task-item strong {
+  width: 100%;
+  padding: 10px 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  outline: none;
   font-size: 12px;
-  font-weight: 500;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  line-height: 1.5;
-}
-.task-item small {
-  display: block;
-  font-size: 11px;
-  color: var(--text-3);
-  margin-top: 5px;
-}
-.task-item small span {
-  padding: 0 3px;
-}
-.task-dot {
-  flex-shrink: 0;
-  width: 5px;
-  height: 5px;
-  background: var(--text-3);
-  border-radius: 50%;
-  margin-top: 6px;
-}
-.task-dot.attention {
-  background: var(--warning);
-  box-shadow: 0 0 0 3px var(--warning-bg);
-}
-.task-dot.done {
-  background: var(--success);
-}
-.sidebar-empty {
-  font-size: 12px;
-  color: var(--text-3);
-  padding: 15px 11px;
 }
 .sidebar-bottom {
   margin-top: auto;
@@ -2545,11 +2502,7 @@ button.danger:hover {
   .brand > span:last-child,
   .new-task kbd,
   .sidebar-label,
-  .project-row,
-  .add-repo,
-  .search-field,
-  .task-list,
-  .tasks-label {
+  .repository-nav {
     display: none;
   }
   .new-task {
