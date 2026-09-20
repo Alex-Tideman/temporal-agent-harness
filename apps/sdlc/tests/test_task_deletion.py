@@ -150,6 +150,26 @@ async def test_interrupted_preparation_can_be_removed_without_temporal(context):
     context.handle.terminate.assert_not_awaited()
 
 
+@pytest.mark.parametrize("remove", [False, True])
+async def test_deletion_cleans_up_preview_before_forgetting_it(
+    context, monkeypatch, remove
+):
+    from sdlc_builder import previews, sandbox
+
+    calls = []
+    monkeypatch.setattr(previews, "saved", lambda _: {"status": "running"})
+    monkeypatch.setattr(previews, "stop", lambda _: calls.append("stop"))
+    monkeypatch.setattr(
+        sandbox,
+        "release",
+        lambda _, **kwargs: calls.append("kill" if kwargs["remove"] else "pause"),
+    )
+    monkeypatch.setattr(previews, "forget", lambda _: calls.append("forget"))
+    response = await delete(context, remove)
+    assert response.status_code == 200
+    assert calls == (["kill", "forget"] if remove else ["stop", "pause", "forget"])
+
+
 async def test_deletion_serializes_with_control_and_requires_auth(context):
     reached = asyncio.Event()
     release = asyncio.Event()

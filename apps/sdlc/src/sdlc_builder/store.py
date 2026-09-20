@@ -79,6 +79,20 @@ class Store:
             rows = db.execute(f"SELECT * FROM {table} ORDER BY rowid DESC").fetchall()
         return [self.decode(row) for row in rows]
 
+    def setting(self, key: str, default=None):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT value FROM metadata WHERE key=?", (key,)
+            ).fetchone()
+        return json.loads(row["value"]) if row else default
+
+    def save_setting(self, key: str, value):
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, json.dumps(value)),
+            )
+
     @staticmethod
     def decode(row) -> dict:
         value = json.loads(row["value"])

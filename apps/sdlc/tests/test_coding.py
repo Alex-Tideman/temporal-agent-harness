@@ -209,6 +209,41 @@ async def test_controller_waits_for_settling_script_operation():
     obj.operation.assert_awaited_once()
 
 
+@pytest.mark.parametrize(
+    "mode,role,approved",
+    [
+        ("ask", "implementer", True),
+        ("change", "reviewer", True),
+        ("change", "coordinator", True),
+        ("change", "implementer", False),
+    ],
+)
+async def test_preview_setup_requires_approved_implementer(mode, role, approved):
+    obj = controller(mode, role)
+    if not approved:
+        obj.approved_scope = []
+    assert not (await obj.dispatch(ToolCall(kind="preview"))).ok
+    obj.operation.assert_not_called()
+
+
+async def test_preview_operation_records_failure_for_agent_and_is_not_repeated(
+    repo, monkeypatch
+):
+    from sdlc_builder import previews
+
+    task, _ = repo
+    verify = AsyncMock(
+        return_value={"ok": False, "detail": "HTTP 500", "logs": "compile error"}
+    )
+    monkeypatch.setattr(previews, "verify", verify)
+    call = ToolCall(kind="preview")
+    result = await coding_operation(task, "preview-check", call)
+    assert not result.ok and result.error == "HTTP 500"
+    assert "compile error" in result.output
+    assert await coding_operation(task, "preview-check", call) == result
+    verify.assert_awaited_once()
+
+
 async def test_code_mode_limits_and_durable_resume():
     from temporal_agent_harness.harness.code_mode.batch_models import (
         CallResult,

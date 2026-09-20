@@ -8,7 +8,6 @@ import difflib
 import hashlib
 import json
 import re
-import subprocess
 import time
 from pathlib import Path
 
@@ -71,26 +70,7 @@ def snapshot(raw: bytes = b"", *, exists=False, mode="", issue="") -> dict:
     return value
 
 
-def source_snapshot(root: Path, path: str) -> dict:
-    # Never dereference links, including links in parent directories.
-    target = ws.safe_path(root, path)
-    if not target.exists():
-        return snapshot()
-    if not target.is_file():
-        return snapshot(exists=True, issue="Not a regular file; inspect locally.")
-    stat = target.stat()
-    mode = "100755" if stat.st_mode & 0o111 else "100644"
-    if stat.st_size > ws.MAX_FILE:
-        return snapshot(
-            exists=True, mode=mode, issue="File exceeds the 100 KB review limit."
-        )
-    with target.open("rb") as stream:
-        raw = stream.read(ws.MAX_FILE + 1)
-    if len(raw) > ws.MAX_FILE:
-        return snapshot(
-            exists=True, mode=mode, issue="File exceeds the 100 KB review limit."
-        )
-    return snapshot(raw, exists=True, mode=mode)
+source_snapshot = ws.source_snapshot
 
 
 def base_revision(task: dict) -> str:
@@ -102,31 +82,7 @@ def base_revision(task: dict) -> str:
     return base
 
 
-def base_snapshot(root: Path, base: str, path: str) -> dict:
-    # --literal-pathspecs in ws.git protects unusual Git filenames.
-    record = ws.git(root, "ls-tree", "-l", "-z", base, "--", path)
-    if not record:
-        return snapshot()
-    meta, name = record.rstrip("\0").split("\t", 1)
-    mode, kind, oid, size = meta.split()
-    if name != path or kind != "blob" or mode == "120000":
-        return snapshot(
-            exists=True,
-            mode=mode,
-            issue="Link or non-regular base file; inspect locally.",
-        )
-    if int(size) > ws.MAX_FILE:
-        return snapshot(
-            exists=True, mode=mode, issue="Base file exceeds the 100 KB review limit."
-        )
-    raw = subprocess.run(
-        ["git", "cat-file", "blob", oid],
-        cwd=root,
-        capture_output=True,
-        check=True,
-        timeout=10,
-    ).stdout
-    return snapshot(raw, exists=True, mode=mode)
+base_snapshot = ws.base_snapshot
 
 
 def file_pair(root: Path, task: dict, review: dict, path: str, comparison="all"):
@@ -161,10 +117,15 @@ def summary(root: Path, task: dict, review: dict) -> dict:
     names.update(review["checkpoints"])
     names.update(c["path"] for c in review["comments"])
     names = sorted(name for name in names if ws.allowed(name))
+    pairs = ws.review_snapshots(root, base, names[:MAX_REVIEW_FILES])
     rows, tokens = [], {}
     for path in names[:MAX_REVIEW_FILES]:
         try:
-            original, current, checkpoint = file_pair(root, task, review, path)
+            pair = pairs[path]
+            if isinstance(pair, dict):
+                raise ValueError(pair["error"])
+            original, current = pair
+            checkpoint = review["checkpoints"].get(path)
         except ValueError as error:
             # Excluded symlinks/ignored files remain visibly unavailable, never read.
             rows.append(

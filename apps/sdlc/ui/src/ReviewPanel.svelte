@@ -569,7 +569,8 @@
   }
   h2 {
     margin-top: 7px;
-    font: 20px var(--font-mono);
+    font: 600 20px var(--font-sans);
+    letter-spacing: -0.4px;
   }
   h2 span {
     color: var(--text-3);
@@ -582,7 +583,7 @@
   }
   .comparison-bar small {
     color: var(--text-3);
-    font-size: 10px;
+    font-size: 11px;
     max-width: 350px;
     line-height: 1.5;
   }
@@ -596,7 +597,7 @@
     border: 0;
     background: transparent;
     min-height: 28px;
-    font-size: 10px;
+    font-size: 11px;
     border-radius: 3px;
   }
   .segmented button[aria-pressed="true"] {
@@ -645,12 +646,12 @@
   }
   .file-name small {
     display: block;
-    font: 9px var(--font-sans);
+    font: 11px var(--font-sans);
     color: var(--text-3);
     margin-top: 5px;
   }
   .file-count {
-    font: 9px var(--font-mono);
+    font: 11px var(--font-mono);
     display: grid;
     gap: 4px;
   }
@@ -664,14 +665,14 @@
   }
   .review-files .comments-link {
     color: var(--text-2);
-    font-size: 11px;
+    font-size: 12px;
     border-bottom: 1px solid var(--border);
     margin-bottom: 6px;
   }
   .comments-link span {
     margin-left: auto;
     color: var(--accent-soft);
-    font: 10px var(--font-mono);
+    font: 11px var(--font-mono);
   }
   .review-files > p {
     font-size: 12px;
@@ -695,11 +696,11 @@
   .file-heading small {
     display: block;
     margin-top: 6px;
-    font-size: 10px;
+    font-size: 11px;
     color: var(--text-3);
   }
   .file-heading button {
-    font-size: 10px;
+    font-size: 11px;
   }
   .file-heading button.marked {
     color: var(--success);
@@ -708,7 +709,7 @@
   }
   .file-heading > span {
     color: var(--text-3);
-    font-size: 11px;
+    font-size: 12px;
   }
   .diff-instruction {
     display: flex;
@@ -717,10 +718,10 @@
     padding: 8px 20px;
     gap: 8px;
     color: var(--text-3);
-    font-size: 10px;
+    font-size: 11px;
   }
   .diff-instruction button {
-    font-size: 10px;
+    font-size: 11px;
     border: 0;
     background: transparent;
     padding: 4px;
@@ -752,7 +753,7 @@
   }
   .diff-line > span {
     color: var(--text-3);
-    font: 10px/23px var(--font-mono);
+    font: 11px/23px var(--font-mono);
     text-align: right;
     padding-right: 8px;
     user-select: none;
@@ -786,7 +787,7 @@
   }
   .diff-meta {
     padding: 8px 20px;
-    font: 10px var(--font-mono);
+    font: 11px var(--font-mono);
     color: var(--warning);
   }
   .empty-diff {
@@ -833,7 +834,7 @@
     align-items: center;
   }
   .comment-draft strong {
-    font-size: 11px;
+    font-size: 12px;
     line-height: 1.6;
     overflow-wrap: anywhere;
   }
@@ -842,7 +843,7 @@
     font-size: 12px;
   }
   .comment-draft small {
-    font-size: 10px;
+    font-size: 11px;
     color: var(--text-3);
   }
   .review-comments {
@@ -878,11 +879,11 @@
   .comment-heading small {
     display: block;
     color: var(--text-3);
-    font-size: 10px;
+    font-size: 11px;
     margin-top: 5px;
   }
   .comment-heading button {
-    font-size: 10px;
+    font-size: 11px;
     min-height: 26px;
     padding: 3px 8px;
   }
@@ -901,7 +902,7 @@
     display: block;
     margin-top: 10px;
     color: var(--text-3);
-    font: 9px var(--font-mono);
+    font: 11px var(--font-mono);
   }
   .review-footer {
     display: flex;
@@ -917,7 +918,7 @@
     font-weight: 500;
   }
   .review-footer p {
-    font-size: 10px;
+    font-size: 11px;
     color: var(--text-3);
     margin-top: 4px;
     max-width: 450px;

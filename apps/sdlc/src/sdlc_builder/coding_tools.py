@@ -8,6 +8,7 @@ from temporal_agent_harness.harness import agent
 from .coding_models import (
     EditRequest,
     FileRequest,
+    FilesRequest,
     PatchRequest,
     SearchRequest,
     ToolCall,
@@ -25,6 +26,11 @@ def coding_tools(dispatch, *, writer: bool):
     async def read_file(request: FileRequest) -> ToolResult:
         """Read a text file and its exact hash; use that hash for edits."""
         return await dispatch(ToolCall(kind="read", path=request.path))
+
+    @agent.tool_defn()
+    async def read_files(request: FilesRequest) -> ToolResult:
+        """Read up to 20 related files with exact hashes in one operation. Prefer this for inspection."""
+        return await dispatch(ToolCall(kind="read_many", paths=request.paths))
 
     @agent.tool_defn()
     async def search_code(request: SearchRequest) -> ToolResult:
@@ -51,7 +57,21 @@ def coding_tools(dispatch, *, writer: bool):
         """Replace exactly one occurrence, guarded by the file's expected hash."""
         return await dispatch(ToolCall(kind="edit", edit=request))
 
-    native = [list_files, read_file, search_code, get_diff, get_workspace_revision]
+    @agent.tool_defn()
+    async def prepare_and_test_preview(restart: bool = False) -> ToolResult:
+        """Detect a web app, install its tooling/dependencies in E2B, start it and check its public HTTP URL. Call directly after web changes; inspect logs and fix startup failures within scope. Set restart=True after dependency or server configuration changes. May take several minutes. This is a smoke check, not a browser interaction test."""
+        return await dispatch(
+            ToolCall(kind="preview", query="restart" if restart else "")
+        )
+
+    native = [
+        list_files,
+        read_file,
+        read_files,
+        search_code,
+        get_diff,
+        get_workspace_revision,
+    ]
     if writer:
         native += [apply_patch, edit_file]
     sandbox = agent.code_mode_tool(
@@ -80,4 +100,5 @@ def coding_tools(dispatch, *, writer: bool):
     execute_code.__doc__ = sandbox.__doc__
     # tool_defn captures metadata at decoration time, so decorate under final name.
     execute_code = agent.tool_defn()(execute_code)
-    return [*native, execute_code]
+    # Installation outlives Code Mode's short per-step limit; use a direct tool.
+    return [*native, execute_code, *([prepare_and_test_preview] if writer else [])]

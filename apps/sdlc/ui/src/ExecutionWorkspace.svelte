@@ -78,10 +78,10 @@
     <span class="eyebrow"
       ><span class:live={live && progress.status === "running"} class="signal"
       ></span>{!live
-        ? "SAVED STATE"
+        ? "Saved state"
         : progress.status === "running"
-          ? "LIVE EXECUTION"
-          : "EXECUTION WORKSPACE"}</span
+          ? "Live execution"
+          : "Execution workspace"}</span
     >
     <span class="state-version"
       >state v{version} · {turnCalls}/{progress.max_steps} calls this message</span
@@ -112,7 +112,7 @@
   <div class="execution-grid">
     <div class="agent-map">
       <div class="map-heading">
-        <span class="eyebrow">AGENTS</span><button
+        <span class="eyebrow">Agents</span><button
           class:following
           aria-pressed={following}
           title="Follow the current agent"
@@ -185,7 +185,7 @@
       </div>
       <div class="inspector-body">
         {#if inspector === "remaining"}
-          <span class="eyebrow">WHAT HAPPENS NEXT</span>
+          <span class="eyebrow">Next steps</span>
           <h2>{progress.next_action || "Waiting for the next instruction"}</h2>
           <ol class="remaining-list">
             {#each remaining as step}<li>
@@ -202,13 +202,13 @@
             </ul>{/if}
           {#if progress.gate}<div class="decision-hint">
               <strong>{progress.gate.title}</strong>
-              <p>Respond in the decision panel below to continue.</p>
+              <p>Use the action bar at the top to review and respond.</p>
             </div>{/if}
         {:else if role === "coordinator"}
           <span class="eyebrow"
             >{blueprint
-              ? `BLUEPRINT ${blueprint.revision} / ${blueprint.approved ? "APPROVED" : "PROPOSED"}`
-              : "REPOSITORY UNDERSTANDING"}</span
+              ? `Blueprint ${blueprint.revision} / ${blueprint.approved ? "Approved" : "Proposed"}`
+              : "Repository context"}</span
           >
           <h2>{blueprint?.summary || progress.focus}</h2>
           {#if blueprint}
@@ -239,7 +239,7 @@
               {#each progress.risks as risk}<li>{risk}</li>{/each}
             </ul>{/if}
         {:else if role === "implementer"}
-          <span class="eyebrow">IMPLEMENTATION / {selected?.status}</span>
+          <span class="eyebrow">Implementation / {selected?.status}</span>
           <h2>
             {selected?.status === "running"
               ? "Working in your task workspace"
@@ -269,10 +269,10 @@
           >
         {:else}
           <span class="eyebrow"
-            >INDEPENDENT REVIEW / {progress.verification?.replaceAll(
+            >Independent review / {progress.verification?.replaceAll(
               "_",
               " ",
-            ) ?? "NOT RUN"}</span
+            ) ?? "Not run"}</span
           >
           <h2>Latest review evidence</h2>
           <p class="agent-output">{output || selected?.operation}</p>
@@ -313,11 +313,13 @@
   <div class="execution-footer">
     <span
       >{progress.gate
-        ? "DECISION REQUIRED"
-        : progress.status.replaceAll("_", " ").toUpperCase()}</span
+        ? "Decision required"
+        : progress.status.replaceAll("_", " ")}</span
     >
     <p>{progress.gate?.title || progress.next_action || progress.focus}</p>
-    <span class="operations">{progress.host_calls ?? 0} host operations</span>
+    <span class="operations"
+      >{progress.host_calls ?? 0} workspace operations</span
+    >
   </div>
 </section>
 
@@ -350,7 +352,7 @@
     box-shadow: 0 0 12px color-mix(in srgb, var(--live) 35%, transparent);
   }
   .state-version {
-    font: 10px var(--font-mono);
+    font: 11px var(--font-mono);
     color: var(--text-3);
   }
   .stage-track {
@@ -366,11 +368,11 @@
     display: flex;
     gap: 8px;
     align-items: center;
-    padding: 10px 0;
+    padding: 12px 0;
     border-top: 1px solid var(--border-strong);
     color: var(--text-3);
     min-width: 105px;
-    font-size: 11px;
+    font-size: 12px;
   }
   .stage-track li.current {
     color: var(--live);
@@ -382,7 +384,7 @@
   }
   .stage-track small {
     display: block;
-    font-size: 9px;
+    font-size: 11px;
     margin-top: 3px;
     opacity: 0.8;
   }
@@ -390,11 +392,11 @@
     display: grid;
     place-items: center;
     min-width: 22px;
-    font: 10px var(--font-mono);
+    font: 11px var(--font-mono);
   }
   .execution-grid {
     display: grid;
-    grid-template-columns: 260px minmax(0, 1fr);
+    grid-template-columns: 244px minmax(0, 1fr);
     min-height: 420px;
     border-top: 1px solid var(--border);
   }
@@ -412,7 +414,7 @@
     margin-bottom: 18px;
   }
   .map-heading button {
-    font-size: 10px;
+    font-size: 11px;
     min-height: 26px;
     padding: 4px 6px;
     background: var(--surface-0);
@@ -431,7 +433,7 @@
     width: 100%;
     text-align: left;
     padding: 13px;
-    border-radius: 6px;
+    border-radius: 8px;
     border-color: var(--border);
     background: var(--surface-1);
   }
@@ -445,9 +447,11 @@
     background: var(--border-strong);
   }
   .agent-node.selected {
-    border-color: var(--accent);
-    box-shadow: inset 2px 0 var(--accent);
-    background: var(--accent-bg);
+    border-color: var(--accent-border);
+    box-shadow:
+      inset 2px 0 var(--accent),
+      0 4px 12px #0002;
+    background: color-mix(in srgb, var(--accent) 6%, var(--surface-1));
   }
   .node-label {
     display: flex;
@@ -464,11 +468,11 @@
   .node-label small {
     margin-left: auto;
     color: var(--text-3);
-    font: 10px var(--font-mono);
+    font: 11px var(--font-mono);
   }
   .node-status {
-    font: 9px var(--font-mono);
-    text-transform: uppercase;
+    font: 11px var(--font-mono);
+    text-transform: capitalize;
     display: flex;
     gap: 6px;
     align-items: center;
@@ -485,7 +489,7 @@
     color: var(--live);
   }
   .agent-node p {
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-2);
     overflow-wrap: anywhere;
     display: -webkit-box;
@@ -496,7 +500,7 @@
   }
   .node-count {
     display: block;
-    font: 9px var(--font-mono);
+    font: 11px var(--font-mono);
     color: var(--text-3);
     margin-top: 12px;
   }
@@ -509,11 +513,11 @@
     gap: 7px;
     margin: 22px 0 3px;
     color: var(--text-3);
-    font-size: 10px;
+    font-size: 11px;
   }
   .artifact-inspector {
     min-width: 0;
-    background: var(--surface-spine);
+    background: var(--surface-1);
   }
   .inspector-tabs {
     display: flex;
@@ -527,7 +531,7 @@
     border-bottom: 1px solid transparent;
     background: transparent;
     border-radius: 0;
-    font-size: 11px;
+    font-size: 12px;
     padding: 12px 0;
     color: var(--text-3);
   }
@@ -539,7 +543,7 @@
     margin-left: auto;
   }
   .inspector-tabs span {
-    font: 9px var(--font-mono);
+    font: 11px var(--font-mono);
     color: var(--accent-soft);
   }
   .inspector-body {
@@ -549,13 +553,14 @@
   }
   h2 {
     margin: 10px 0 20px;
-    font-size: 19px;
+    font-size: 21px;
+    letter-spacing: -0.4px;
     line-height: 1.5;
     font-weight: 500;
     overflow-wrap: anywhere;
   }
   h3 {
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-3);
     margin: 22px 0 10px;
   }
@@ -635,7 +640,7 @@
   }
   .check-summary span {
     flex: 1;
-    font-size: 11px;
+    font-size: 12px;
     text-align: left;
   }
   .finding {
@@ -643,9 +648,9 @@
     border-top: 1px solid var(--border);
   }
   .finding > span {
-    font: 9px var(--font-mono);
+    font: 11px var(--font-mono);
     color: var(--warning);
-    text-transform: uppercase;
+    text-transform: capitalize;
   }
   .finding button {
     border: 0;
@@ -678,7 +683,7 @@
   .remaining-list small {
     display: block;
     color: var(--text-3);
-    font-size: 10px;
+    font-size: 11px;
     margin-top: 4px;
   }
   .decision-hint {
@@ -700,13 +705,13 @@
     padding: 14px 20px;
   }
   .execution-footer > span {
-    font: 9px var(--font-mono);
+    font: 11px var(--font-mono);
     color: var(--accent-soft);
     flex-shrink: 0;
   }
   .execution-footer p {
     color: var(--text-2);
-    font-size: 11px;
+    font-size: 12px;
     overflow-wrap: anywhere;
   }
   .execution-footer .operations {

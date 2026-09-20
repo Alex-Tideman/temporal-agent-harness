@@ -36,7 +36,7 @@ from temporalio.envconfig import ClientConfig
 from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Worker
 
-from . import reviews, workspaces
+from . import previews, repositories, reviews, sandbox, workspaces
 from .activities import decide, workspace_action
 from .bounded_code import bounded_resume, bounded_start
 from .coding_workflow import WORKFLOW_NAME_V2, CodingRoleWorkflow, CodingWorkflow
@@ -44,6 +44,7 @@ from .coding_workspace import coding_operation, project_merge_operation
 from .integrations import integration_for, profile_available, registered_integrations
 from .models import Control, FollowUpInput, Profile, TaskInput
 from .store import Store, data_dir, workspace
+from .worker_lifecycle import managed_worker
 from .workflow import TASK_QUEUE, WORKFLOW_NAME, SdlcAgentWorkflow
 
 
@@ -79,6 +80,12 @@ class FileEdit(BaseModel):
 
 class DeleteTask(BaseModel):
     remove_workspace: bool = False
+
+
+class StartPreview(BaseModel):
+    command: str = Field(default="", max_length=4000)
+    cwd: str | None = Field(default=None, max_length=4000)
+    port: int | None = Field(default=None, ge=1024, le=65535)
 
 
 class NewMessage(BaseModel):
@@ -130,6 +137,8 @@ def create_app() -> FastAPI:
         large_payload_offload=offload,
     )
     task_locks: dict[str, asyncio.Lock] = {}
+    folder_picker_lock = asyncio.Lock()
+    project_lock = asyncio.Lock()
     profile_checks: set[str] = set()
     removing_profiles: set[str] = set()
 
@@ -181,17 +190,24 @@ def create_app() -> FastAPI:
         return receipt
 
     async def reconcile(app):
+        slots = asyncio.Semaphore(8)
+
+        async def collect(identity):
+            async with slots, task_locks.setdefault(identity, asyncio.Lock()):
+                try:
+                    task = store.get("tasks", identity)
+                except ValueError:
+                    return
+                return await reconcile_task(app, task)
+
         while True:
-            for listed in store.all("tasks"):
-                # Dispatch, deletion, and user controls share a lock. Re-read
-                # after acquiring it so a queued dispatch cannot resurrect a
-                # task deleted while the collector was working on another task.
-                async with task_locks.setdefault(listed["id"], asyncio.Lock()):
-                    try:
-                        task = store.get("tasks", listed["id"])
-                    except ValueError:
-                        continue
-                    await reconcile_task(app, task)
+            # One slow task must not delay dispatch/progress for every other task.
+            results = await asyncio.gather(
+                *(collect(t["id"]) for t in store.all("tasks"))
+            )
+            observed = [result for result in results if result is not None]
+            if observed:
+                app.state.temporal_ok = all(observed)
             await asyncio.sleep(1)
 
     async def reconcile_task(app, task):
@@ -221,17 +237,17 @@ def create_app() -> FastAPI:
                 task["workflow_id"]
             ).query("progress", rpc_timeout=timedelta(seconds=3))
             store.archive(task["id"], state)
-            app.state.temporal_ok = True
+            return True
         except asyncio.CancelledError:
             raise
         except Exception as error:
             # Keep the last known snapshot. UI marks it stale instead of erasing progress.
-            app.state.temporal_ok = False
             if task.get("dispatch") != "submitted":
                 task["dispatch_error"] = (
                     f"Waiting to dispatch ({type(error).__name__}). Retrying automatically."
                 )
                 store.put("tasks", task)
+            return False
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
@@ -253,26 +269,36 @@ def create_app() -> FastAPI:
         app.state.client = client
         async with contextlib.AsyncExitStack() as stack:
             await stack.enter_async_context(
-                Worker(
-                    client,
-                    task_queue=TASK_QUEUE,
-                    workflows=[SdlcAgentWorkflow, CodingWorkflow, CodingRoleWorkflow],
-                    activities=[
-                        decide,
-                        coding_operation,
-                        project_merge_operation,
-                        bounded_start,
-                        bounded_resume,
-                    ],
-                    plugins=[
-                        plugin
-                        for backend in integrations
-                        for plugin in backend.worker_plugins()
-                    ],
+                managed_worker(
+                    Worker(
+                        client,
+                        task_queue=TASK_QUEUE,
+                        workflows=[
+                            SdlcAgentWorkflow,
+                            CodingWorkflow,
+                            CodingRoleWorkflow,
+                        ],
+                        activities=[
+                            decide,
+                            coding_operation,
+                            project_merge_operation,
+                            bounded_start,
+                            bounded_resume,
+                        ],
+                        plugins=[
+                            plugin
+                            for backend in integrations
+                            for plugin in backend.worker_plugins()
+                        ],
+                    )
                 )
             )
             await stack.enter_async_context(
-                create_session_manager_worker(client, task_queue="sdlc-session-manager")
+                managed_worker(
+                    create_session_manager_worker(
+                        client, task_queue="sdlc-session-manager"
+                    )
+                )
             )
             # Mounted FastAPI applications do not enter their lifespan automatically.
             await stack.enter_async_context(harness.router.lifespan_context(harness))
@@ -357,32 +383,114 @@ def create_app() -> FastAPI:
 
     @app.get("/api/home")
     async def home():
+        config = sandbox.configuration()
+        projects = store.all("projects")
+        removed = {item["id"] for item in projects if item.get("removed")}
         return {
-            "projects": store.all("projects"),
+            "projects": [item for item in projects if item["id"] not in removed],
             "profiles": [
                 {**profile, "available": profile_available(profile)}
                 for profile in store.all("profiles")
             ],
-            "tasks": store.all("tasks"),
+            "tasks": [
+                preparation_state(task)
+                for task in store.all("tasks")
+                if task.get("project_id") not in removed
+            ],
             "health": {
                 "temporal": app.state.temporal_ok,
                 "harness_version": importlib.metadata.version("temporal-agent-harness"),
                 "data_dir": str(data_dir()),
-                "execution": "host-with-approval",
+                "execution": "e2b"
+                if config["backend"] == "e2b"
+                else "host-with-approval",
+                "sandbox_ready": config["ready"],
+                "sandbox_template": config["template"],
                 "milestone": "3 · execution workspace and interactive review",
             },
         }
 
+    def preparation_state(task: dict) -> dict:
+        if task.get("dispatch") == "preparing":
+            lock = task_locks.get(task["id"])
+            task["preparation_running"] = bool(lock and lock.locked())
+            if not task["preparation_running"] and not task.get("preparation_error"):
+                task["preparation_error"] = (
+                    "Workspace setup was interrupted. Retry setup to continue."
+                )
+        return task
+
+    @app.post("/api/projects/pick-folder")
+    async def pick_project_folder():
+        if folder_picker_lock.locked():
+            raise HTTPException(
+                409, "Finish choosing a folder in the open picker first."
+            )
+        async with folder_picker_lock:
+            return await asyncio.to_thread(repositories.pick_folder)
+
+    @app.get("/api/projects/folders")
+    async def browse_project_folders(path: str = ""):
+        return await asyncio.to_thread(repositories.browse, path)
+
+    @app.get("/api/projects/discovery")
+    async def discover_projects():
+        return await asyncio.to_thread(repositories.discover, store)
+
+    @app.post("/api/projects/discovery")
+    async def set_projects_folder(body: NewProject):
+        path = await asyncio.to_thread(repositories.directory, body.path)
+        store.save_setting("projects_folder", str(path))
+        return await asyncio.to_thread(repositories.discover, store)
+
+    @app.delete("/api/projects/discovery")
+    async def forget_projects_folder():
+        store.save_setting("projects_folder", "")
+        return await asyncio.to_thread(repositories.discover, store)
+
+    @app.post("/api/projects/{identity}/open")
+    async def open_project(identity: str):
+        async with project_lock:
+            project = store.get("projects", identity)
+            if project.get("removed"):
+                raise HTTPException(409, "Add this repository again before opening it")
+            project["last_opened"] = time.time()
+            store.put("projects", project)
+            return project
+
+    @app.delete("/api/projects/{identity}")
+    async def remove_project(identity: str):
+        async with project_lock:
+            project = store.get("projects", identity)
+            # Keep the identity for workflows and restore its history when the
+            # same canonical path is connected again. Never touch its files.
+            project["removed"] = True
+            store.put("projects", project)
+            return {"ok": True}
+
     @app.post("/api/projects")
     async def add_project(body: NewProject):
-        path = Path(body.path).expanduser().resolve()
-        actual = (
-            await asyncio.to_thread(
-                workspaces.git, path, "rev-parse", "--show-toplevel"
-            )
-        ).strip()
+        async with project_lock:
+            return await connect_project(body)
+
+    async def connect_project(body: NewProject):
+        path = await asyncio.to_thread(repositories.directory, body.path)
+        try:
+            actual = (
+                await asyncio.to_thread(
+                    workspaces.git, path, "rev-parse", "--show-toplevel"
+                )
+            ).strip()
+        except ValueError:
+            raise ValueError(
+                "This folder is not inside a Git repository. Choose a repository or one of its subfolders."
+            ) from None
+        actual = str(Path(actual).resolve())
         for item in store.all("projects"):
             if item["path"] == actual:
+                item["last_opened"] = time.time()
+                item.pop("removed", None)
+                store.put("projects", item)
                 return item
         remote = await asyncio.to_thread(workspaces.git, path, "remote", "-v")
         # Do not persist embedded HTTP credentials in remote URLs.
@@ -407,6 +515,7 @@ def create_app() -> FastAPI:
             "name": Path(actual).name,
             "path": actual,
             "github_url": origin,
+            "last_opened": time.time(),
         }
         store.put("projects", project)
         return project
@@ -570,6 +679,14 @@ def create_app() -> FastAPI:
                     )
                 return previous
             project = store.get("projects", body.project_id)
+            if project.get("removed"):
+                raise HTTPException(
+                    409, "Add this repository again before starting a task"
+                )
+            if not sandbox.configuration()["ready"]:
+                raise ValueError(
+                    "Set E2B_API_KEY in the launch environment and restart boltzmann before starting a workspace."
+                )
             if body.profile_id in removing_profiles:
                 raise HTTPException(
                     409, "Wait for profile removal and select another profile"
@@ -615,6 +732,7 @@ def create_app() -> FastAPI:
                 "profile_id": profile.id,
                 "created_at": time.time(),
                 "dispatch": "preparing",
+                "parent_task_id": body.parent_task_id,
                 "input": task_input.model_dump(),
             }
             store.put("tasks", task)
@@ -636,7 +754,53 @@ def create_app() -> FastAPI:
             except (ValueError, OSError) as error:
                 task.update(dispatch="preparing", preparation_error=str(error))
                 store.put("tasks", task)
-                raise
+                raise ValueError(str(error)) from None
+            task.update(prepared, dispatch="pending")
+            store.put("tasks", task)
+            return task
+
+    @app.post("/api/tasks/{identity}/retry-setup")
+    async def retry_setup(identity: str):
+        lock = task_locks.setdefault(identity, asyncio.Lock())
+        if lock.locked():
+            raise HTTPException(409, "Workspace setup is already in progress")
+        async with lock:
+            task = store.get("tasks", identity)
+            if task.get("dispatch") != "preparing":
+                return task  # A previous retry succeeded; never initialize twice.
+            project = store.get("projects", task["project_id"])
+            if project.get("removed"):
+                raise HTTPException(
+                    409, "Add this repository again before retrying setup"
+                )
+            task.pop("preparation_error", None)
+            store.put("tasks", task)
+            try:
+                if sandbox.is_remote(workspace(identity)):
+                    prepared = await asyncio.to_thread(sandbox.retry_preparation, task)
+                elif task.get("parent_task_id"):
+                    parent_id = task["parent_task_id"]
+                    async with task_locks.setdefault(parent_id, asyncio.Lock()):
+                        parent = await get_task(parent_id)
+                        if not parent.get("can_message"):
+                            raise ValueError(
+                                "Finish or stop the parent task before retrying its workspace"
+                            )
+                        prepared = await asyncio.to_thread(
+                            workspaces.continue_workspace, parent_id, identity
+                        )
+                elif task["input"].get("continuation_context"):
+                    raise ValueError(
+                        "Start a new task from the original parent; this older task has no saved parent reference"
+                    )
+                else:
+                    prepared = await asyncio.to_thread(
+                        workspaces.prepare_workspace, project["path"], identity
+                    )
+            except (ValueError, OSError) as error:
+                task["preparation_error"] = str(error)
+                store.put("tasks", task)
+                raise ValueError(str(error)) from None
             task.update(prepared, dispatch="pending")
             store.put("tasks", task)
             return task
@@ -644,6 +808,8 @@ def create_app() -> FastAPI:
     @app.get("/api/tasks/{identity}")
     async def get_task(identity: str):
         task = store.get("tasks", identity)
+        if task.get("dispatch") == "preparing":
+            return {**preparation_state(task), "live": False, "can_message": False}
         try:
             envelope = await app.state.client.get_workflow_handle(
                 task["workflow_id"]
@@ -810,6 +976,14 @@ def create_app() -> FastAPI:
                         503,
                         "Could not close this task in Temporal. Try deleting again; the task and workspace were kept.",
                     ) from None
+            try:
+                if not body.remove_workspace and previews.saved(task_workspace):
+                    await preview_operation(previews.stop, task_workspace)
+                await asyncio.to_thread(
+                    sandbox.release, task_workspace, remove=body.remove_workspace
+                )
+            except ValueError as error:
+                raise HTTPException(409, str(error)) from None
             if body.remove_workspace:
                 try:
                     if task_workspace.exists():
@@ -819,12 +993,44 @@ def create_app() -> FastAPI:
                         409,
                         "The task is stopped, but its workspace could not be fully removed. Check file permissions and retry, or delete with the workspace option unchecked to keep the remaining files.",
                     ) from None
+            previews.forget(task_workspace)
             store.delete_task(identity)
             return {
                 "ok": True,
                 "workspace_removed": body.remove_workspace,
-                "workspace": str(task_workspace),
+                "workspace": task.get("workspace", str(task_workspace)),
             }
+
+    async def preview_operation(operation, *args):
+        try:
+            return await asyncio.to_thread(operation, *args)
+        except ValueError:
+            raise
+        except Exception:
+            raise HTTPException(
+                503,
+                "Could not reach the sandbox preview. Refresh its status or check your E2B connection.",
+            ) from None
+
+    @app.get("/api/tasks/{identity}/preview")
+    async def get_preview(identity: str):
+        async with task_locks.setdefault(identity, asyncio.Lock()):
+            store.get("tasks", identity)
+            return await preview_operation(previews.inspect, workspace(identity))
+
+    @app.post("/api/tasks/{identity}/preview")
+    async def start_preview(identity: str, body: StartPreview):
+        async with task_locks.setdefault(identity, asyncio.Lock()):
+            store.get("tasks", identity)
+            return await preview_operation(
+                previews.start, workspace(identity), body.command, body.cwd, body.port
+            )
+
+    @app.delete("/api/tasks/{identity}/preview")
+    async def stop_preview(identity: str):
+        async with task_locks.setdefault(identity, asyncio.Lock()):
+            store.get("tasks", identity)
+            return await preview_operation(previews.stop, workspace(identity))
 
     @app.get("/api/tasks/{identity}/files")
     async def list_files(identity: str):

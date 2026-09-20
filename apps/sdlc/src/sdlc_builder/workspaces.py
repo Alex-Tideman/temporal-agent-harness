@@ -1,156 +1,46 @@
-"""Repository boundaries and idempotent writes; host commands require a user gate."""
+"""Workspace routing, lifecycle and guarded delivery into the source checkout."""
 
 import asyncio
 import hashlib
 import json
-import os
-import signal
 import subprocess
-import tempfile
 from pathlib import Path
 
+from . import workspace_runtime as runtime
+from .sandbox import remote_capable
 from .store import data_dir, workspace
+from .workspace_runtime import MAX_FILE as MAX_FILE
+from .workspace_runtime import allowed as allowed
+from .workspace_runtime import git_apply, safe_path
 
-MAX_FILE = 100_000
-DENIED_PARTS = {
-    ".git",
-    "node_modules",
-    ".venv",
-    "__pycache__",
-    ".ssh",
-    ".aws",
-    ".gnupg",
-}
+git = remote_capable(runtime.git)
+files = remote_capable(runtime.files)
+read_file = remote_capable(runtime.read_file)
+write_file = remote_capable(runtime.write_file)
+diff_entries = remote_capable(runtime.diff_entries)
+changed_paths = remote_capable(runtime.changed_paths)
+diff = remote_capable(runtime.diff)
+search_files = remote_capable(runtime.search_files)
+source_snapshot = remote_capable(runtime.source_snapshot)
+base_snapshot = remote_capable(runtime.base_snapshot)
+review_snapshots = remote_capable(runtime.review_snapshots)
 
 
-def git(root: Path, *args: str) -> str:
-    result = subprocess.run(
-        [
-            "git",
-            "--literal-pathspecs",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            *args,
-        ],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=45,
+async def execute_check(root: Path, argv: list[str]) -> dict:
+    from .sandbox import call, is_remote
+
+    if is_remote(root):
+        return await asyncio.to_thread(call, root, "execute_check", argv)
+    return await runtime.execute_check(
+        root, argv, data_dir() / "command-homes" / root.name
     )
-    if result.returncode:
-        raise ValueError(result.stderr.strip()[:1000] or "Git command failed")
-    return result.stdout
-
-
-def allowed(relative: str) -> bool:
-    parts = Path(relative).parts
-    return (
-        bool(parts)
-        and not Path(relative).is_absolute()
-        and all(
-            p not in DENIED_PARTS
-            and p not in {"..", "."}
-            and not p.lower().startswith(".env")
-            and not p.lower().endswith((".pem", ".key", ".p12", ".pfx"))
-            and p.lower()
-            not in {
-                "credentials",
-                "credentials.json",
-                "secrets.json",
-                "secrets.yaml",
-                "secrets.yml",
-                "secrets.toml",
-                ".npmrc",
-                ".pypirc",
-                ".netrc",
-                ".git-credentials",
-                "id_rsa",
-                "id_ed25519",
-            }
-            for p in parts
-        )
-    )
-
-
-def safe_path(root: Path, relative: str) -> Path:
-    if not allowed(relative):
-        raise ValueError(
-            "Path is outside the workspace or excluded as a secret/generated file"
-        )
-    path = root / relative
-    for ancestor in [path, *path.parents]:
-        if ancestor == root:
-            break
-        if ancestor.is_symlink():
-            raise ValueError("Symlinks are not supported by workspace tools")
-    if not path.resolve().is_relative_to(root.resolve()):
-        raise ValueError("Path escapes workspace")
-    # Ignored local files (including provider credentials) are never tool inputs.
-    ignored = subprocess.run(
-        ["git", "check-ignore", "--quiet", "--", relative],
-        cwd=root,
-        capture_output=True,
-    )
-    if ignored.returncode == 0:
-        raise ValueError("Ignored files are excluded")
-    return path
-
-
-def files(root: Path) -> list[str]:
-    names = git(
-        root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"
-    ).split("\0")
-    return sorted({p for p in names if allowed(p) and not (root / p).is_symlink()})[
-        :3000
-    ]
-
-
-def read_file(root: Path, relative: str) -> dict:
-    path = safe_path(root, relative)
-    if not path.is_file():
-        return {"path": relative, "exists": False, "hash": "", "content": ""}
-    if path.stat().st_size > MAX_FILE:
-        raise ValueError("File exceeds the 100 KB text limit")
-    raw = path.read_bytes()
-    if b"\0" in raw:
-        raise ValueError("Binary file")
-    return {
-        "path": relative,
-        "exists": True,
-        "hash": hashlib.sha256(raw).hexdigest(),
-        "content": raw.decode("utf-8"),
-    }
-
-
-def write_file(root: Path, relative: str, content: str, expected_hash: str) -> dict:
-    path = safe_path(root, relative)
-    raw = content.encode("utf-8")
-    if len(raw) > MAX_FILE:
-        raise ValueError("File exceeds the 100 KB text limit")
-    current = read_file(root, relative)
-    digest = hashlib.sha256(raw).hexdigest()
-    # Recovery after write succeeded but activity completion was lost.
-    if current["exists"] and current["hash"] == digest:
-        return {"path": relative, "hash": digest, "unchanged": True}
-    if current["hash"] != expected_hash:
-        raise ValueError(
-            "File changed since it was read. Read it again before editing."
-        )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
-        tmp.write(raw)
-        tmp.flush()
-        os.fsync(tmp.fileno())
-        temp = Path(tmp.name)
-    if path.exists():
-        temp.chmod(path.stat().st_mode & 0o777)
-    temp.replace(path)
-    return {"path": relative, "hash": digest}
 
 
 def prepare_workspace(source: str, task_id: str) -> dict:
+    from .sandbox import configuration, prepare
+
+    if configuration()["backend"] == "e2b":
+        return prepare(source, task_id)
     root = workspace(task_id)
     source_path = Path(source).expanduser().resolve()
     base = git(source_path, "rev-parse", "HEAD").strip()
@@ -171,126 +61,12 @@ def prepare_workspace(source: str, task_id: str) -> dict:
     git(root, "config", "core.hooksPath", "/dev/null")
     git(root, "checkout", "--detach", base)
     git(root, "switch", "-c", f"sdlc/{task_id[:8]}")
-    return {"workspace": str(root), "base_commit": base, "source_dirty": dirty}
-
-
-def diff_entries(root: Path, base_revision: str = "HEAD") -> list[tuple[str, str]]:
-    """Return one supported text patch per changed path."""
-    output = []
-    # Include files deleted by a later local commit when exporting from a task's
-    # original base. Agent tools retain their existing HEAD comparison.
-    names = set(files(root))
-    names.update(
-        git(
-            root,
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--name-only",
-            "-z",
-            base_revision,
-            "--",
-        ).split("\0")
-    )
-    for name in sorted(name for name in names if allowed(name)):
-        try:
-            read_file(
-                root, name
-            )  # Enforce size, binary, secret, and symlink exclusions.
-            base = subprocess.run(
-                ["git", "show", f"{base_revision}:{name}"],
-                cwd=root,
-                capture_output=True,
-                timeout=5,
-            )
-            if len(base.stdout) > MAX_FILE:
-                continue
-            if base.returncode == 0:
-                patch = git(
-                    root,
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--no-color",
-                    base_revision,
-                    "--",
-                    name,
-                )
-            else:
-                result = subprocess.run(
-                    [
-                        "git",
-                        "diff",
-                        "--no-index",
-                        "--no-ext-diff",
-                        "--no-textconv",
-                        "--no-color",
-                        "--",
-                        "/dev/null",
-                        name,
-                    ],
-                    cwd=root,
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                patch = result.stdout
-            if patch:
-                output.append((name, patch))
-        except (ValueError, UnicodeError):
-            continue
-    return output
-
-
-def changed_paths(root: Path, base_revision: str) -> list[str]:
-    """List every tracked or untracked path changed from the task base."""
-    tracked = git(
-        root,
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--name-only",
-        "-z",
-        base_revision,
-        "--",
-    ).split("\0")
-    untracked = git(root, "ls-files", "-z", "--others", "--exclude-standard").split(
-        "\0"
-    )
-    return sorted({name for name in [*tracked, *untracked] if name})
-
-
-def diff(root: Path, base_revision: str = "HEAD") -> dict:
-    # Include untracked files without mutating the index; filter secrets even if tracked.
-    entries = diff_entries(root, base_revision)
-    patch = "".join(value for _, value in entries)
     return {
-        "files": [name for name, _ in entries],
-        "patch": patch[:500_000],
-        "truncated": len(patch) > 500_000,
+        "workspace": str(root),
+        "workspace_backend": "local",
+        "base_commit": base,
+        "source_dirty": dirty,
     }
-
-
-def git_apply(root: Path, patch: str, *options: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [
-            "git",
-            "--literal-pathspecs",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "apply",
-            "--whitespace=nowarn",
-            *options,
-            "--",
-        ],
-        cwd=root,
-        input=patch,
-        capture_output=True,
-        text=True,
-        timeout=45,
-    )
 
 
 def merge_to_project(
@@ -339,6 +115,28 @@ def merge_to_project(
     for name in paths:
         safe_path(source_root, name)
 
+    # Remote outputs are untrusted. Validate each patch's actual paths on the
+    # host before git apply can mutate the source checkout.
+    for name, patch in entries:
+        inspected = git_apply(source_root, patch, "--numstat", "-z")
+        records = [
+            record.split("\t", 2) for record in inspected.stdout.split("\0") if record
+        ]
+        if (
+            inspected.returncode
+            or len(records) != 1
+            or len(records[0]) != 3
+            or records[0][2] != name
+            or not all(n.isdigit() for n in records[0][:2])
+            or any(
+                line in {"new file mode 120000", "new mode 120000"}
+                for line in patch.splitlines()
+            )
+        ):
+            raise ValueError(
+                "The task returned an unsupported patch. Nothing was changed."
+            )
+
     pending = []
     already_present = []
     for name, patch in entries:
@@ -379,7 +177,11 @@ def merge_to_project(
 
 
 def continue_workspace(parent_id: str, task_id: str) -> dict:
+    from .sandbox import configuration, is_remote, prepare
+
     parent = workspace(parent_id)
+    if configuration()["backend"] == "e2b" or is_remote(parent):
+        return prepare("", task_id, parent_id=parent_id)
     patch = diff(parent)
     if patch["truncated"]:
         raise ValueError(
@@ -402,57 +204,6 @@ def continue_workspace(parent_id: str, task_id: str) -> dict:
     prepared["source_dirty"] = False
     prepared["parent_task_id"] = parent_id
     return prepared
-
-
-async def execute_check(root: Path, argv: list[str]) -> dict:
-    if not argv or len(argv) > 100 or any("\0" in arg for arg in argv):
-        raise ValueError("Expected a nonempty argument vector")
-    scratch = data_dir() / "command-homes" / root.name
-    scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # Host mode is explicitly approved in the UI. A cwd is NOT a security sandbox.
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": str(scratch),
-        "TMPDIR": str(scratch),
-        "LANG": "en_US.UTF-8",
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONUNBUFFERED": "1",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-    }
-    process = await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=root,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        start_new_session=True,
-    )
-    chunks = bytearray()
-    reason = ""
-    try:
-        async with asyncio.timeout(90):
-            while block := await process.stdout.read(8192):
-                chunks.extend(block)
-                if len(chunks) > 100_000:
-                    reason = "Stopped at 100 KB output limit"
-                    break
-            if not reason:
-                await process.wait()
-    except TimeoutError:
-        reason = "Stopped at 90 second limit"
-    finally:
-        # Also remove surviving children if the main process exited successfully.
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        await process.wait()
-    return {
-        "exit_code": process.returncode if not reason else -1,
-        "output": chunks[:100_000].decode("utf-8", errors="replace")
-        + ("\n" + reason if reason else ""),
-    }
 
 
 async def perform(task_id: str, operation_id: str, action: dict) -> dict:
@@ -505,27 +256,6 @@ async def perform(task_id: str, operation_id: str, action: dict) -> dict:
     temporary.write_text(json.dumps({"fingerprint": fingerprint, "result": result}))
     temporary.replace(record)
     return result
-
-
-def search_files(root: Path, query: str) -> list[dict]:
-    import time
-
-    deadline = time.monotonic() + 20
-    hits = []
-    for name in files(root):
-        if time.monotonic() > deadline or len(hits) >= 80:
-            break
-        try:
-            for number, line in enumerate(
-                read_file(root, name)["content"].splitlines(), 1
-            ):
-                if query.lower() in line.lower():
-                    hits.append({"path": name, "line": number, "text": line[:400]})
-                if len(hits) >= 80:
-                    break
-        except (ValueError, UnicodeError):
-            pass
-    return hits
 
 
 def demo_project() -> Path:

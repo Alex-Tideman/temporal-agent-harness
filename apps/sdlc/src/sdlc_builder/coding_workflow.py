@@ -351,8 +351,15 @@ class CodingWorkflow(SdlcAgentWorkflow):
         return await workflow.execute_activity(
             coding_operation,
             args=[self.current_task.task_id, workflow.uuid4().hex, call],
-            start_to_close_timeout=timedelta(seconds=115),
+            start_to_close_timeout=timedelta(
+                seconds=630 if call.kind == "preview" else 180
+            ),
             retry_policy=RetryPolicy(maximum_attempts=1),
+            **(
+                {"heartbeat_timeout": timedelta(seconds=60)}
+                if call.kind == "preview"
+                else {}
+            ),
         )
 
     async def controller_operation(self, call: ToolCall) -> ToolResult:
@@ -431,6 +438,15 @@ class CodingWorkflow(SdlcAgentWorkflow):
                 ok=False,
                 error="Only the controller can run human-approved verification recipes",
             )
+        if call.kind == "preview" and (
+            self.current_task.mode != "change"
+            or self.active_role != "implementer"
+            or not self.approved_scope
+        ):
+            return ToolResult(
+                ok=False,
+                error="Preview setup requires an approved Change assignment for the implementer",
+            )
         with self.state.mutate() as state:
             state.host_calls += 1
             actor = next(a for a in state.actors if a.id == self.active_actor)
@@ -440,7 +456,7 @@ class CodingWorkflow(SdlcAgentWorkflow):
         result = await self.operation(call)
         if (
             self.active_role == "reviewer"
-            and call.kind in {"read", "diff"}
+            and call.kind in {"read", "read_many", "diff"}
             and result.ok
         ):
             self.review_reads += 1
@@ -556,7 +572,7 @@ class CodingWorkflow(SdlcAgentWorkflow):
             workflow.uuid4().hex,
             "command",
             "Approve verification commands",
-            "Run at the workspace root, on your computer, with a scrubbed environment. These commands may execute repository code.\n\n"
+            "Run at the task workspace root with a scrubbed environment. These commands may execute repository code.\n\n"
             + "\n".join(shlex.join(c.argv) for c in blueprint.checks)
             + f"\n\nSource revision: {fresh.revision}",
         )
@@ -580,6 +596,7 @@ class CodingWorkflow(SdlcAgentWorkflow):
                 revision=result.before_revision,
                 after_revision=result.revision,
                 stale=result.before_revision != result.revision or not result.ok,
+                duration_ms=result.duration_ms,
             )
             evidence.append(receipt)
             with self.state.mutate() as state:
@@ -766,6 +783,21 @@ class CodingWorkflow(SdlcAgentWorkflow):
                 implementation = await self.child(
                     "implementer", json.dumps(handoff), reserve=2
                 )
+                preview = None
+                if workflow.patched("automatic-preview-v1"):
+                    with self.state.mutate() as state:
+                        state.focus = "Preparing and checking the app preview"
+                    preview = await self.controller_operation(ToolCall(kind="preview"))
+                    self.entry(
+                        preview.operation_id or workflow.uuid4().hex,
+                        "tool",
+                        "Preview: "
+                        + (
+                            preview.error
+                            if not preview.ok
+                            else "HTTP smoke check completed or no web app detected"
+                        ),
+                    )
                 evidence = await self.verify(blueprint)
                 fresh = await self.controller_operation(ToolCall(kind="revision"))
                 if not fresh.ok:
@@ -781,6 +813,7 @@ class CodingWorkflow(SdlcAgentWorkflow):
                             "revision": fresh.revision,
                             "checks": [c.model_dump(mode="json") for c in evidence],
                             "instruction": "Inspect the actual diff and source independently; do not assume passing checks cover all requirements.",
+                            **({"preview": preview.output} if preview else {}),
                         }
                     ),
                 )
@@ -800,6 +833,7 @@ class CodingWorkflow(SdlcAgentWorkflow):
                 verified = (
                     complete
                     and self.review_reads > 0
+                    and (preview is None or preview.ok)
                     and not implementation.missing_evidence
                     and fresh.revision == after.revision
                     and not review.missing_evidence
@@ -821,6 +855,11 @@ class CodingWorkflow(SdlcAgentWorkflow):
                         review.missing_evidence
                         + implementation.missing_evidence
                         + (
+                            ["Preview check failed: " + preview.error]
+                            if preview and not preview.ok
+                            else []
+                        )
+                        + (
                             []
                             if self.review_reads
                             else [
@@ -834,7 +873,12 @@ class CodingWorkflow(SdlcAgentWorkflow):
                         )
                     )
                     state.verification = "verified" if verified else "incomplete"
-                if verified or attempt == 1 or self.remaining() < 3 or not evidence:
+                if (
+                    verified
+                    or attempt == 1
+                    or self.remaining() < 3
+                    or (not evidence and (preview is None or preview.ok))
+                ):
                     return self.finish(
                         implementation.summary
                         + "\n\n"
@@ -848,6 +892,7 @@ class CodingWorkflow(SdlcAgentWorkflow):
                 handoff["repair"] = {
                     "checks": [c.model_dump(mode="json") for c in evidence],
                     "review": review.model_dump(mode="json"),
+                    **({"preview": preview.output} if preview else {}),
                     "instruction": "One repair attempt within the approved scope. Do not change the requirements or check recipe.",
                 }
             raise RuntimeError("Repair limit reached")

@@ -15,7 +15,6 @@
     Terminal,
     Code2,
     MessageSquare,
-    FlaskConical,
     ChevronRight,
     X,
     Activity,
@@ -29,6 +28,9 @@
     GitMerge,
     Search,
     Trash2,
+    LayoutDashboard,
+    Server,
+    Monitor,
   } from "@lucide/svelte";
   import {
     api,
@@ -43,13 +45,27 @@
   } from "./types";
   import ExecutionWorkspace from "./ExecutionWorkspace.svelte";
   import ReviewPanel from "./ReviewPanel.svelte";
+  import PreviewPanel from "./PreviewPanel.svelte";
+  import RepositoryDialog from "./RepositoryDialog.svelte";
+  import RepositorySelect from "./RepositorySelect.svelte";
+  import TaskActionBar from "./TaskActionBar.svelte";
+  import { taskAttention } from "./attention";
 
   let home = $state<Home | null>(null);
+  let workspaceProjects = $derived(
+    home?.projects
+      .filter((project) => !project.demo)
+      .sort((a, b) => (b.last_opened ?? 0) - (a.last_opened ?? 0)) ?? [],
+  );
+  let configuredProfiles = $derived(
+    home?.profiles.filter((profile) => profile.provider !== "demo") ?? [],
+  );
   let active = $state<Task | null>(null);
   let view = $state("workspace");
   let tab = $state("activity");
   let composer = $state(false);
   let busy = $state(false);
+  let startingTask = $state(false);
   let error = $state("");
   let toast = $state("");
   let deleteDialog = $state<HTMLDialogElement>();
@@ -64,15 +80,37 @@
   let locked = $state(false);
   let unlockToken = $state("");
   let projectId = $state("");
+  let selectedRepositoryId = $state("");
+  let selectedRepository = $derived(
+    workspaceProjects.find((item) => item.id === selectedRepositoryId),
+  );
+  let repositoryTasks = $derived(
+    home?.tasks.filter(
+      (task) =>
+        !selectedRepositoryId || task.project_id === selectedRepositoryId,
+    ) ?? [],
+  );
+  let repositoryAttention = $derived(
+    repositoryTasks.filter((task) => taskAttention(task)),
+  );
+  let repositoryRunning = $derived(
+    repositoryTasks.filter((task) => task.snapshot?.value.status === "running"),
+  );
   let profileId = $state("");
   let recoveryProfileId = $state("");
   let mode = $state("change");
   let prompt = $state("");
   let parentTaskId = $state("");
-  let projectPath = $state("");
-  let feedback = $state("");
-  let acceptanceNote = $state("");
+  let repositoryDialog = $state<{ show: () => Promise<void> }>();
+  let removeRepositoryDialog = $state<HTMLDialogElement>();
+  let repositoryToRemove = $state<Project | null>(null);
+  let removingRepository = $state(false);
+  let removeRepositoryError = $state("");
   let query = $state("");
+  let attentionMenu = $state<HTMLDetailsElement>();
+  let attentionTasks = $derived(
+    home?.tasks.filter((task) => taskAttention(task)) ?? [],
+  );
   let reviewPath = $state("");
   let reviewRequest = $state(0);
   let traceWorkflow = $state("");
@@ -101,14 +139,7 @@
   let currentTurn = $derived(turns.at(-1));
   let messageDraft = $derived(active ? messageDrafts[active.id] : undefined);
   let taskProfiles = $derived(
-    home?.profiles.filter(
-      (p) =>
-        p.available !== false &&
-        (p.provider !== "demo" ||
-          home?.projects.some(
-            (project) => project.id === projectId && project.demo,
-          )),
-    ) ?? [],
+    configuredProfiles.filter((profile) => profile.available !== false),
   );
   function preferredTaskProfile() {
     return (
@@ -190,7 +221,7 @@
     ),
   );
   let filteredTasks = $derived(
-    home?.tasks.filter((t) =>
+    repositoryTasks.filter((t) =>
       (t.title + t.project_name).toLowerCase().includes(query.toLowerCase()),
     ) ?? [],
   );
@@ -203,11 +234,19 @@
       ),
   );
   let canDelete = $derived(
-    active?.dispatch === "preparing" || active?.can_message,
+    (active?.dispatch === "preparing" && !active.preparation_running) ||
+      active?.can_message,
   );
   let lastGate = "";
   let selection = 0;
   let refreshing = false;
+  let navigationKey = $derived(
+    `${view}:${composer}:${active?.id ?? ""}:${selectedRepositoryId}`,
+  );
+  $effect(() => {
+    navigationKey;
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+  });
 
   const statusLabel = (status?: string) =>
     ({
@@ -239,7 +278,8 @@
     try {
       home = await api<Home>("/home");
       locked = false;
-      if (!projectId && home.projects.length) projectId = home.projects[0].id;
+      if (!workspaceProjects.some((project) => project.id === projectId))
+        projectId = workspaceProjects[0]?.id ?? "";
       if (active) {
         const identity = active.id;
         const next = await api<Task>("/tasks/" + identity);
@@ -263,7 +303,6 @@
         const gate = next.snapshot?.value.gate;
         if (gate && gate.id !== lastGate) {
           lastGate = gate.id;
-          feedback = "";
           if (
             "Notification" in window &&
             Notification.permission === "granted" &&
@@ -375,9 +414,10 @@
     if (selectionId !== selection) return;
     if (active?.id !== next.id) {
       recoveryProfileId = "";
-      acceptanceNote = "";
     }
     active = next;
+    selectedRepositoryId = next.project_id;
+    rememberRepository(next.project_id);
     reviewPath = "";
     traceWorkflow = "";
     ensureMessageDraft(next);
@@ -387,55 +427,124 @@
     selectedFile = "";
     fileText = "";
     originalText = "";
-    feedback = "";
     lastGate = "";
     localStorage.setItem("sdlc.active", task.id);
+  }
+  function openOverview() {
+    if (
+      fileText !== originalText &&
+      !confirm("Discard your unsaved editor changes?")
+    )
+      return false;
+    ++selection;
+    view = "workspace";
+    active = null;
+    composer = false;
+    selectedRepositoryId = "";
+    parentTaskId = "";
+    selectedFile = "";
+    fileText = "";
+    originalText = "";
+    localStorage.removeItem("sdlc.active");
+    return true;
+  }
+  function rememberRepository(identity: string) {
+    const item = home?.projects.find((project) => project.id === identity);
+    if (item) item.last_opened = Date.now() / 1000;
+    void api("/projects/" + identity + "/open", "POST", {}).catch(() => {});
+  }
+  function openRepository(identity: string) {
+    if (!openOverview()) return false;
+    selectedRepositoryId = identity;
+    projectId = identity;
+    rememberRepository(identity);
+    setTimeout(() => promptEl?.focus(), 0);
+    return true;
   }
   function newTask() {
     if (!profileId || profileId === "demo") profileId = preferredTaskProfile();
     composer = true;
+    selectedRepositoryId = "";
     view = "workspace";
     parentTaskId = "";
     setTimeout(() => promptEl?.focus(), 0);
   }
   async function startTask() {
-    await attempt(async () => {
-      const task = await api<Task>("/tasks", "POST", {
-        id: crypto.randomUUID().replaceAll("-", ""),
-        project_id: projectId,
-        profile_id: profileId,
-        mode,
-        prompt,
-        parent_task_id: parentTaskId,
+    if (busy || !projectId || !profileId || !prompt.trim()) return;
+    startingTask = true;
+    try {
+      await attempt(async () => {
+        const task = await api<Task>("/tasks", "POST", {
+          id: crypto.randomUUID().replaceAll("-", ""),
+          project_id: projectId,
+          profile_id: profileId,
+          mode,
+          prompt,
+          parent_task_id: parentTaskId,
+        });
+        localStorage.removeItem("sdlc.draft");
+        prompt = "";
+        parentTaskId = "";
+        await selectTask(task);
+        await refresh();
       });
-      localStorage.removeItem("sdlc.draft");
-      prompt = "";
-      parentTaskId = "";
-      await selectTask(task);
-      await refresh();
-    });
+    } finally {
+      startingTask = false;
+    }
   }
-  async function demo() {
-    await attempt(async () => {
-      const item = await api<Project>("/demo", "POST");
-      await refresh();
-      projectId = item.id;
-      prompt = "Fix the greeting so the existing unittest passes.";
-      mode = "change";
-      newTask();
-      // The explicitly requested tour remains scripted and needs no API key.
-      profileId = "demo";
-    });
+  async function repositoryConnected(item: Project) {
+    if (home && !home.projects.some((project) => project.id === item.id))
+      home.projects = [...home.projects, item];
+    if (!openRepository(item.id)) return false;
+    toast = `${item.name} is ready. Describe your task to get started.`;
+    return true;
   }
-  async function addProject() {
+  function confirmRemoveRepository(item: Project) {
+    repositoryToRemove = item;
+    removeRepositoryError = "";
+    removeRepositoryDialog?.showModal();
+  }
+  async function removeRepository() {
+    if (!repositoryToRemove || removingRepository) return;
+    const item = repositoryToRemove;
+    removingRepository = true;
+    try {
+      await api("/projects/" + item.id, "DELETE");
+      if (home) {
+        home.projects = home.projects.filter(
+          (project) => project.id !== item.id,
+        );
+        home.tasks = home.tasks.filter((task) => task.project_id !== item.id);
+      }
+      if (active?.project_id === item.id) {
+        fileText = originalText;
+        openOverview();
+        view = "settings";
+      } else if (selectedRepositoryId === item.id) selectedRepositoryId = "";
+      if (projectId === item.id) projectId = workspaceProjects[0]?.id ?? "";
+      removeRepositoryDialog?.close();
+      toast = `${item.name} removed. Add the same folder again to restore its tasks.`;
+    } catch (e) {
+      removeRepositoryError = (e as Error).message;
+    } finally {
+      removingRepository = false;
+    }
+  }
+  async function retrySetup() {
+    if (!active || busy) return;
+    const identity = active.id;
     await attempt(async () => {
-      const item = await api<Project>("/projects", "POST", {
-        path: projectPath,
-      });
-      projectPath = "";
-      await refresh();
-      projectId = item.id;
-      toast = "Repository added. New tasks start from its committed HEAD.";
+      try {
+        const task = await api<Task>(
+          "/tasks/" + identity + "/retry-setup",
+          "POST",
+          {},
+        );
+        if (active?.id === identity) active = task;
+        toast = "Workspace ready. Your task is queued to start.";
+      } finally {
+        await refresh();
+      }
     });
   }
   async function testProvider(identity: string) {
@@ -457,19 +566,24 @@
       testingProfiles[identity] = false;
     }
   }
-  async function control(command: string, approved = true) {
+  async function control(
+    command: string,
+    approved = true,
+    text = "",
+    gateId = progress?.gate?.id ?? "",
+  ) {
+    let succeeded = false;
     await attempt(async () => {
       await api("/tasks/" + active!.id + "/control", "POST", {
         command,
-        gate_id: progress?.gate?.id ?? "",
+        gate_id: gateId,
         approved,
-        text:
-          command === "accept" && progress?.engine === "v2"
-            ? acceptanceNote
-            : feedback,
+        text,
       });
       await refresh();
+      succeeded = true;
     });
+    return succeeded;
   }
   function openReview(path = "") {
     reviewPath = path;
@@ -690,6 +804,12 @@
     });
   }
   function keyboard(event: KeyboardEvent) {
+    if (
+      event.defaultPrevented ||
+      (event.target instanceof Element &&
+        event.target.closest("dialog[open], [popover]:popover-open"))
+    )
+      return;
     if ((event.metaKey || event.ctrlKey) && event.key === "k") {
       event.preventDefault();
       newTask();
@@ -773,44 +893,43 @@
 {:else}
   <div class="app-shell">
     <aside class="sidebar">
-      <button
-        class="brand"
-        aria-label="boltzmann home"
-        onclick={() => {
-          view = "workspace";
-          composer = false;
-          active = null;
-        }}
+      <button class="brand" aria-label="boltzmann home" onclick={openOverview}
         ><span class="brandmark" aria-hidden="true"
           ><Brain class="brand-icon" size={23} strokeWidth={1.75} /></span
-        ><span
-          >boltzmann<span class="subbrand">DEVELOPMENT JUST HAPPENS</span></span
+        ><span>boltzmann<span class="subbrand">Agent workspace</span></span
         ></button
       >
-      <button class="new-task" onclick={newTask}
+      <button class="new-task" aria-label="New task" onclick={newTask}
         ><Plus size={17} /> New task <kbd>⌘ K</kbd></button
       >
+      <button
+        class="workspace-nav"
+        class:nav-active={view === "workspace" &&
+          !active &&
+          !composer &&
+          !selectedRepositoryId}
+        aria-label="Workspace overview"
+        onclick={openOverview}
+        ><LayoutDashboard size={16} /><span>Overview</span></button
+      >
       <div class="sidebar-label">
-        WORKSPACE <span>{home?.projects.length ?? 0}</span>
+        Repositories <span>{workspaceProjects.length}</span>
       </div>
-      {#each home?.projects ?? [] as item}
+      {#each workspaceProjects as item}
         <button
-          class:project-selected={projectId === item.id}
+          class:project-selected={selectedRepositoryId === item.id}
           class="project-row"
-          onclick={() => {
-            projectId = item.id;
-            newTask();
-          }}
-          ><FolderOpen size={15} /><span>{item.name}</span>{#if item.demo}<span
-              class="tiny-pill">DEMO</span
-            >{/if}</button
+          onclick={() => openRepository(item.id)}
+          ><FolderOpen size={15} /><span>{item.name}</span></button
         >
       {/each}
-      <button class="text-button add-repo" onclick={() => (view = "settings")}
+      <button
+        class="text-button add-repo"
+        onclick={() => repositoryDialog?.show()}
         ><Plus size={14} /> Add repository</button
       >
       <div class="sidebar-label tasks-label">
-        TASKS <span>{home?.tasks.length ?? 0}</span>
+        Tasks <span>{repositoryTasks.length}</span>
       </div>
       <div class="search-field">
         <Search size={14} /><input
@@ -828,30 +947,37 @@
           >
             <span
               class="task-dot"
-              class:attention={task.snapshot?.value.status === "needs_you"}
+              class:attention={!!taskAttention(task)}
               class:done={task.snapshot?.value.status === "accepted"}
             ></span>
             <span
               ><strong>{task.title}</strong><small
                 >{task.project_name} <span>·</span>
-                {statusLabel(task.snapshot?.value.status)}</small
+                {taskAttention(task) ||
+                  statusLabel(task.snapshot?.value.status)}</small
               ></span
             >
           </button>
         {/each}
         {#if !filteredTasks.length}<p class="sidebar-empty">
-            Your work, decisions, and progress will live here.
+            No tasks yet. Start a task to see its progress here.
           </p>{/if}
       </nav>
       <div class="sidebar-bottom">
         <button
           class:nav-active={view === "settings"}
+          aria-label="Settings"
           onclick={() => (view = "settings")}
-          ><Settings2 size={16} /> Settings <kbd>⌘ ,</kbd></button
+          ><Settings2 size={16} /><span>Settings</span><kbd>⌘ ,</kbd></button
         >
         <div class="local-status">
-          <span class:online={home?.health.temporal}></span> Local workspace
-          <span class="version">V2</span>
+          <span class:online={home?.health.temporal}></span>
+          {home?.health.execution === "e2b"
+            ? "E2B workspaces"
+            : "Local workspaces"}
+          <span class="version"
+            >{home?.health.temporal ? "Online" : "Offline"}</span
+          >
         </div>
       </div>
     </aside>
@@ -864,12 +990,36 @@
               ? "Settings"
               : active && !composer
                 ? active.project_name
-                : "Overview"}</span
+                : composer
+                  ? "New task"
+                  : selectedRepository?.name || "Overview"}</span
           >
         </div>
         <div class="topbar-right">
-          <span class="local-badge"><ShieldCheck size={13} /> LOCAL FIRST</span
-          ><button
+          {#if attentionTasks.length}
+            <details class="attention-menu" bind:this={attentionMenu}>
+              <summary
+                ><AlertCircle size={15} />{attentionTasks.length} need attention</summary
+              >
+              <nav aria-label="Tasks needing attention">
+                {#each attentionTasks as task}
+                  <button
+                    onclick={() => {
+                      if (attentionMenu) attentionMenu.open = false;
+                      void attempt(() => selectTask(task));
+                    }}
+                    ><strong>{task.title}</strong><span
+                      >{taskAttention(task)}</span
+                    ></button
+                  >
+                {/each}
+              </nav>
+            </details>
+          {/if}
+          <span class="local-badge" class:connected={home?.health.temporal}>
+            <span class="connection-dot"></span>
+            {home?.health.temporal ? "Worker connected" : "Worker offline"}
+          </span><button
             class="icon-button"
             title="Enable desktop notifications"
             onclick={() => {
@@ -878,6 +1028,21 @@
           >
         </div>
       </header>
+      {#if view === "workspace" && active && !composer}
+        {#key active.id}
+          <TaskActionBar
+            task={active}
+            {busy}
+            {error}
+            oncontrol={control}
+            onreview={() => openReview()}
+            oncontinue={continueTask}
+            onsettings={() => (view = "settings")}
+            onmerge={confirmMerge}
+            onretry={retrySetup}
+          />
+        {/key}
+      {/if}
       {#if error}<div class="banner error" role="alert">
           <AlertCircle size={16} />{error}<button
             aria-label="Dismiss error"
@@ -893,19 +1058,20 @@
 
       {#if view === "settings"}
         <main class="settings-page">
-          <span class="eyebrow">MAKE YOURSELF AT HOME</span>
-          <h1>Your development setup.</h1>
-          <p class="lede">Your repositories, your models, your machine.</p>
+          <h1>Workspace settings</h1>
+          <p class="lede">
+            Manage repositories, model profiles, and runtime connections.
+          </p>
           <section class="settings-section">
             <div>
               <h2>Repositories</h2>
               <p>
-                Use any local Git repository, including a GitHub checkout. Tasks
-                start in a separate clone from committed HEAD.
+                Choose a local Git repository to start working. Tasks start in
+                an isolated workspace from the latest commit.
               </p>
             </div>
             <div class="settings-body">
-              {#each home?.projects ?? [] as item}<div class="repository-card">
+              {#each workspaceProjects as item}<div class="repository-card">
                   <FolderOpen size={18} />
                   <div>
                     <strong>{item.name}</strong><code>{item.path}</code>
@@ -917,25 +1083,18 @@
                       aria-label="Open GitHub repository"
                       ><ArrowUpRight size={17} /></a
                     >{/if}
+                  <button
+                    class="icon-button"
+                    aria-label={"Remove " + item.name + " repository"}
+                    title="Remove repository"
+                    onclick={() => confirmRemoveRepository(item)}
+                    ><Trash2 size={16} /></button
+                  >
                 </div>{/each}
-              <form
-                class="inline-form"
-                onsubmit={(e) => {
-                  e.preventDefault();
-                  addProject();
-                }}
-              >
-                <input
-                  placeholder="/absolute/path/to/repository"
-                  aria-label="Repository path"
-                  bind:value={projectPath}
-                  required
-                /><button disabled={busy}><Plus size={15} /> Add</button>
-              </form>
-              <button class="text-button" onclick={demo}
-                >Try the built-in demo repository <ArrowRight
-                  size={14}
-                /></button
+              <button
+                class="text-button"
+                onclick={() => repositoryDialog?.show()}
+                ><Plus size={15} />Add repository</button
               >
             </div>
           </section>
@@ -944,8 +1103,8 @@
               <h2>Model profiles</h2>
               <p>
                 Keys are stored in your OS keyring. Environment references are
-                also supported. Each task keeps a snapshot of its profile.
-                OpenAI is supported for new tasks in this milestone.
+                also supported. Each task keeps a snapshot of its profile. New
+                tasks use OpenAI model profiles.
               </p>
             </div>
             <div class="settings-body">
@@ -954,7 +1113,7 @@
                 credential and the agent's action schema. Provider charges may
                 apply. No repository content is sent.
               </p>
-              {#each home?.profiles ?? [] as item}
+              {#each configuredProfiles as item}
                 {@const result = providerChecks[item.id]}
                 <div class="profile-group">
                   <div class="profile-card">
@@ -967,7 +1126,7 @@
                           : " · scripted walkthrough"}</small
                       >
                     </div>
-                    <span class="tiny-pill">{item.max_steps} CALLS</span>
+                    <span class="tiny-pill">{item.max_steps} calls</span>
                     {#if item.id !== "demo"}
                       <button
                         class="secondary provider-test-button"
@@ -1162,13 +1321,24 @@
               </div>
               <div>
                 <span>Execution</span><strong
-                  >Host · approval for every command</strong
+                  >{home?.health.execution === "e2b"
+                    ? "E2B sandbox"
+                    : "Local host"} · command approval</strong
                 >
               </div>
               <p>
-                Commands run on your computer and can access its files and
-                network. Review each command before allowing it. Credentials are
-                removed from the child environment; this is not a sandbox.
+                {#if home?.health.execution === "e2b"}
+                  New workspaces run in E2B. Files and dependencies stay in
+                  their sandbox between messages. Existing local tasks keep
+                  their original workspace.
+                  {#if !home.health.sandbox_ready}
+                    Set E2B_API_KEY in your launch environment and restart to
+                    start a workspace.
+                  {/if}
+                {:else}
+                  Local mode is enabled. Approved commands run on your computer
+                  with access to host files and network.
+                {/if}
               </p>
               <code>{home?.health.data_dir}</code>
             </div>
@@ -1177,120 +1347,231 @@
       {:else if composer || !active}
         <main class="overview">
           <div class="overview-heading">
-            <span class="eyebrow">YOUR DEVELOPMENT DESK</span>
-            <h1>What are we building?</h1>
-            <p class="lede">
-              From the first question to a change you can trust.
-            </p>
-          </div>
-          <section class="compose-card">
-            <div class="compose-title">
-              <div class="mini-mark"><Command size={18} /></div>
-              <h2>
-                {parentTaskId ? "Continue this work" : "Start with an idea"}
-              </h2>
-              <span class="tiny-pill">CODING AGENT V2</span>
+            <div>
+              <h1>
+                {parentTaskId
+                  ? "Continue your work"
+                  : composer
+                    ? "New task"
+                    : selectedRepository?.name || "Workspace"}
+              </h1>
+              <p class="lede">
+                {selectedRepository
+                  ? "Build, inspect, and review changes in this repository."
+                  : "Build, inspect, and review changes across your repositories."}
+              </p>
             </div>
-            <form
-              onsubmit={(e) => {
-                e.preventDefault();
-                startTask();
-              }}
+            <div class="workspace-environment">
+              <Server size={14} />{home?.health.execution === "e2b"
+                ? "E2B sandboxes"
+                : "Local workspaces"}
+            </div>
+          </div>
+          {#if repositoryAttention.length}
+            <button
+              class="overview-attention"
+              onclick={() => attempt(() => selectTask(repositoryAttention[0]))}
             >
-              <div class="mode-switch">
-                <button
-                  type="button"
-                  class:chosen={mode === "change"}
-                  onclick={() => (mode = "change")}
-                  ><Code2 size={15} /> Make a change</button
-                ><button
-                  type="button"
-                  class:chosen={mode === "ask"}
-                  onclick={() => (mode = "ask")}
-                  ><MessageSquare size={15} /> Ask the codebase</button
+              <span class="overview-attention-icon"
+                ><AlertCircle size={18} /></span
+              >
+              <span
+                ><strong
+                  >{repositoryAttention.length}
+                  {repositoryAttention.length === 1
+                    ? "task needs"
+                    : "tasks need"} your attention</strong
+                ><small
+                  >{taskAttention(repositoryAttention[0])}: {repositoryAttention[0]
+                    .title}</small
+                ></span
+              >
+              <span class="attention-cta">Review<ArrowRight size={15} /></span>
+            </button>
+          {/if}
+          {#if composer || selectedRepository}
+            <section class="compose-card">
+              <div class="compose-title">
+                <div class="mini-mark"><Command size={18} /></div>
+                <h2>
+                  {parentTaskId ? "Continue in a new task" : "Start a task"}
+                </h2>
+                <span class="composer-hint" id="task-keyboard-hint"
+                  >Enter to start, Shift+Enter for a new line</span
                 >
               </div>
-              <textarea
-                class="prompt-input"
-                bind:this={promptEl}
-                bind:value={prompt}
-                oninput={(event) =>
-                  localStorage.setItem("sdlc.draft", event.currentTarget.value)}
-                placeholder={mode === "ask"
-                  ? "What would you like to understand about this repository?"
-                  : "Describe a feature, a bug, or a small improvement…"}
-                aria-label="Task description"
-                required
-                rows="5"></textarea>
-              <div class="compose-options">
-                <label
-                  ><FolderOpen size={14} /><select
-                    aria-label="Task repository"
-                    bind:value={projectId}
-                    required
-                    ><option value="" disabled>Select repository</option
-                    >{#each home?.projects ?? [] as item}<option value={item.id}
-                        >{item.name}</option
-                      >{/each}</select
-                  ></label
-                ><label
-                  ><Activity size={14} /><select
-                    aria-label="Model profile"
-                    bind:value={profileId}
-                    required
-                    ><option value="" disabled>Select model profile</option
-                    >{#each taskProfiles as item}<option value={item.id}
-                        >{item.label}</option
-                      >{/each}</select
-                  ></label
-                ><button
-                  class="primary"
-                  disabled={busy || !projectId || !profileId || !prompt.trim()}
-                  >Start task <ArrowRight size={16} /></button
+              <form
+                onsubmit={(e) => {
+                  e.preventDefault();
+                  startTask();
+                }}
+              >
+                <div class="mode-switch">
+                  <button
+                    type="button"
+                    class:chosen={mode === "change"}
+                    aria-pressed={mode === "change"}
+                    onclick={() => (mode = "change")}
+                    ><Code2 size={15} /> Make a change</button
+                  ><button
+                    type="button"
+                    class:chosen={mode === "ask"}
+                    aria-pressed={mode === "ask"}
+                    onclick={() => (mode = "ask")}
+                    ><MessageSquare size={15} /> Ask the codebase</button
+                  >
+                </div>
+                <textarea
+                  class="prompt-input"
+                  bind:this={promptEl}
+                  bind:value={prompt}
+                  oninput={(event) =>
+                    localStorage.setItem(
+                      "sdlc.draft",
+                      event.currentTarget.value,
+                    )}
+                  onkeydown={(event) => {
+                    if (
+                      event.key !== "Enter" ||
+                      event.shiftKey ||
+                      event.isComposing ||
+                      event.keyCode === 229
+                    )
+                      return;
+                    event.preventDefault();
+                    if (!event.repeat)
+                      event.currentTarget.form?.requestSubmit();
+                  }}
+                  placeholder={mode === "ask"
+                    ? "What would you like to understand about this repository?"
+                    : "Describe a feature, a bug, or a small improvement…"}
+                  aria-label="Task description"
+                  aria-describedby="task-keyboard-hint"
+                  required
+                  rows="3"></textarea>
+                <div class="compose-options">
+                  {#if composer}
+                    <RepositorySelect
+                      projects={workspaceProjects}
+                      bind:value={projectId}
+                      disabled={busy}
+                      onadd={() => repositoryDialog?.show()}
+                    />
+                  {/if}<label
+                    ><Activity size={14} /><select
+                      aria-label="Model profile"
+                      bind:value={profileId}
+                      required
+                      ><option value="" disabled>Select model profile</option
+                      >{#each taskProfiles as item}<option value={item.id}
+                          >{item.label}</option
+                        >{/each}</select
+                    ></label
+                  ><button
+                    class="primary"
+                    disabled={busy ||
+                      !projectId ||
+                      !profileId ||
+                      !prompt.trim()}
+                    >{startingTask ? "Preparing sandbox…" : "Start task"}
+                    <ArrowRight size={16} /></button
+                  >
+                </div>
+              </form>
+              <div class="compose-foot">
+                <ShieldCheck size={13} />{startingTask
+                  ? "Selecting the environment and preparing your workspace. First-time setup can take a few minutes."
+                  : parentTaskId
+                    ? "Carries forward the previous workspace changes."
+                    : home?.health.execution === "e2b"
+                      ? "Isolated in E2B. Changes stay separate until you merge."
+                      : "Isolated workspace. Changes stay separate until you merge."}<span
+                  >Plan → Build → Check → Review</span
                 >
               </div>
-            </form>
-            <div class="compose-foot">
-              <GitBranch size={13} />{parentTaskId
-                ? "Carries forward the previous workspace changes."
-                : "A separate workspace. Your checkout stays yours."}<span
-                >Plan → Build → Check → Review</span
+            </section>
+          {/if}
+          {#if !workspaceProjects.length || !taskProfiles.length}
+            <div class="setup-notice">
+              <Settings2 size={16} />
+              <p>
+                {!workspaceProjects.length
+                  ? "Connect a repository"
+                  : "Add a model profile"} to start your first task.
+              </p>
+              <button
+                onclick={() =>
+                  !workspaceProjects.length
+                    ? repositoryDialog?.show()
+                    : (view = "settings")}
+                >{!workspaceProjects.length
+                  ? "Add repository"
+                  : "Open settings"}<ArrowRight size={14} /></button
               >
             </div>
+          {/if}
+          <section class="recent-work" aria-label="Recent tasks">
+            <div class="recent-heading">
+              <h2>Recent tasks <span>{repositoryTasks.length}</span></h2>
+              <span
+                ><span class="running-dot"></span>{repositoryRunning.length} running</span
+              >
+            </div>
+            {#if repositoryTasks.length}
+              <div class="task-table">
+                <div class="task-table-labels" aria-hidden="true">
+                  <span>Task</span><span>Repository</span><span>Status</span
+                  ><span></span>
+                </div>
+                {#each repositoryTasks.slice(0, 8) as task}
+                  <button
+                    class="task-table-row"
+                    onclick={() => attempt(() => selectTask(task))}
+                  >
+                    <span class="recent-task-title"
+                      ><span
+                        class="recent-task-icon"
+                        class:requires-action={!!taskAttention(task)}
+                        >{#if taskAttention(task)}<AlertCircle
+                            size={16}
+                          />{:else if task.snapshot?.value.status === "accepted"}<Check
+                            size={16}
+                          />{:else}<Activity size={16} />{/if}</span
+                      ><span
+                        ><strong>{task.title}</strong><small
+                          >{task.snapshot?.value.phase || "Preparing"}</small
+                        ></span
+                      ></span
+                    >
+                    <span class="recent-repo"
+                      ><GitBranch size={13} />{task.project_name}</span
+                    >
+                    <span
+                      class="recent-status"
+                      class:requires-action={!!taskAttention(task)}
+                      class:complete={task.snapshot?.value.status ===
+                        "accepted"}
+                      ><span></span>{taskAttention(task) ||
+                        statusLabel(task.snapshot?.value.status)}</span
+                    >
+                    <ChevronRight size={15} class="row-chevron" />
+                  </button>
+                {/each}
+              </div>
+            {:else}
+              <div class="recent-empty">
+                <Activity size={20} />
+                <div>
+                  <h3>Your next task starts here</h3>
+                  <p>
+                    {composer || selectedRepository
+                      ? "Describe a change above. Follow its execution and review the result here."
+                      : "Choose a repository or click New task to get started."}
+                  </p>
+                </div>
+              </div>
+            {/if}
           </section>
-          <div class="welcome-grid">
-            <button class="welcome-card" onclick={demo}
-              ><div class="card-icon green"><FlaskConical size={21} /></div>
-              <span class="eyebrow">A TWO-MINUTE TOUR</span>
-              <h3>Take it for a test drive.</h3>
-              <p>
-                A tiny repository. One broken greeting. Follow a real durable
-                workflow without an API key.
-              </p>
-              <span class="card-link"
-                >Open the demo <ArrowUpRight size={16} /></span
-              ></button
-            ><button class="welcome-card" onclick={() => (view = "settings")}
-              ><div class="card-icon"><FolderOpen size={21} /></div>
-              <span class="eyebrow">BRING YOUR OWN PROJECT</span>
-              <h3>Your next small win.</h3>
-              <p>
-                Connect a local repository and a model profile. Start with a
-                question or a focused change.
-              </p>
-              <span class="card-link"
-                >Set up your workspace <ArrowUpRight size={16} /></span
-              ></button
-            >
-          </div>
-          <div class="milestone-note">
-            <span class="tiny-pill">MILESTONE 03</span>
-            <p>
-              Follow live agent execution, review files, and send targeted
-              corrections in the same task. Ready for your testing before GitHub
-              delivery and CI feedback.
-            </p>
-          </div>
         </main>
       {:else}
         <main class="task-page">
@@ -1299,8 +1580,8 @@
               <div class="task-meta">
                 <span class="eyebrow"
                   >{(progress?.mode ?? active.mode) === "ask"
-                    ? "CODEBASE QUESTION"
-                    : "DEVELOPMENT TASK"}</span
+                    ? "Codebase question"
+                    : "Development task"}</span
                 ><span class="mono">#{active.id.slice(0, 7)}</span>
               </div>
               <h1>{active.title}</h1>
@@ -1316,9 +1597,13 @@
             </div>
             <span
               class="status-pill"
-              class:needs-you={progress?.status === "needs_you"}
+              class:needs-you={!!taskAttention(active)}
               class:accepted={progress?.status === "accepted"}
-              ><span></span>{statusLabel(progress?.status)}</span
+              ><span></span>{active.preparation_error
+                ? "Setup stopped"
+                : active.preparation_running
+                  ? "Preparing workspace"
+                  : statusLabel(progress?.status)}</span
             >
           </div>
           {#if active.live === false && active.snapshot}<div
@@ -1335,7 +1620,12 @@
                 ><Activity size={18} /></span
               >
               <div>
-                <span class="eyebrow">{progress?.phase ?? "QUEUED"}</span
+                <span class="eyebrow"
+                  >{active.preparation_error
+                    ? "SETUP STOPPED"
+                    : active.preparation_running
+                      ? "SETTING UP"
+                      : (progress?.phase ?? "QUEUED")}</span
                 ><strong
                   >{progress?.focus ??
                     active.preparation_error ??
@@ -1374,13 +1664,8 @@
                 >{/if}{#if ["review", "failed", "cancelled", "accepted"].includes(progress?.status ?? "")}<button
                   onclick={continueTask}
                   >Continue <ArrowRight size={14} /></button
-                >{/if}{#if progress?.status === "review"}<button
-                  class="primary"
-                  disabled={busy || !active.can_message}
-                  onclick={() => control("accept")}
-                  ><Check size={14} /> Accept</button
                 >{/if}
-              {#if active.can_message}<button
+              {#if active.can_message && !project?.demo}<button
                   onclick={forkTask}
                   title="Create a separate task from this workspace"
                   ><GitBranch size={14} /> Fork task</button
@@ -1394,23 +1679,10 @@
               >
             </div>
           </section>
-          {#if progress?.engine === "v2"}
-            {#if progress.status === "review" && progress.mode === "change"}
-              <label class="acceptance-note"
-                >Acceptance note {progress.verification === "verified"
-                  ? "(optional)"
-                  : "(required to accept incomplete verification)"}
-                <textarea
-                  bind:value={acceptanceNote}
-                  placeholder="Describe any remaining checks or findings you are accepting."
-                  rows="2"></textarea>
-              </label>
-            {/if}
-          {/if}
           <div class="task-columns">
             <section class="task-work">
               <nav class="tabs" aria-label="Task views">
-                {#each [{ id: "activity", label: "Execution", icon: Activity }, { id: "diff", label: "Review", icon: Code2 }, { id: "files", label: "Files", icon: Files }, { id: "checks", label: "Checks", icon: Terminal }, { id: "debug", label: "Harness", icon: Activity }] as item}<button
+                {#each [{ id: "activity", label: "Execution", icon: Activity }, { id: "preview", label: "Preview", icon: Monitor }, { id: "diff", label: "Review", icon: Code2 }, { id: "files", label: "Files", icon: Files }, { id: "checks", label: "Checks", icon: Terminal }, { id: "debug", label: "Harness", icon: Activity }] as item}<button
                     class:active={tab === item.id}
                     onclick={() => selectTab(item.id)}
                     ><item.icon
@@ -1421,6 +1693,12 @@
                   >{/each}
               </nav>
               {#key active.id}
+                <div hidden={tab !== "preview"}>
+                  <PreviewPanel
+                    taskId={active.id}
+                    visible={tab === "preview"}
+                  />
+                </div>
                 <div hidden={tab !== "diff"}>
                   <ReviewPanel
                     taskId={active.id}
@@ -1517,48 +1795,7 @@
                       </div>
                     </section>
                   {/if}
-                  {#if progress?.gate}<section class="gate-card">
-                      <div class="gate-heading">
-                        <span class="gate-icon"><AlertCircle size={19} /></span>
-                        <div>
-                          <span class="eyebrow">YOUR INPUT IS NEEDED</span>
-                          <h2>{progress.gate.title}</h2>
-                        </div>
-                      </div>
-                      <pre>{progress.gate.detail}</pre>
-                      {#if progress.gate.kind === "command"}<p
-                          class="command-warning"
-                        >
-                          Runs in <code>{active.workspace}</code> on your computer,
-                          with access to host files and network. The child environment
-                          excludes your provider keys. Allow only commands you trust.
-                        </p>{/if}<textarea
-                        rows="2"
-                        aria-label="Feedback or answer"
-                        placeholder={progress.gate.kind === "question"
-                          ? "Your answer…"
-                          : "Optional feedback or adjustments…"}
-                        bind:value={feedback}></textarea>
-                      <div class="gate-actions">
-                        {#if progress.gate.kind !== "question"}<button
-                            disabled={busy}
-                            onclick={() => control("respond", false)}
-                            >Decline / revise</button
-                          >{/if}<button
-                          class="primary"
-                          disabled={busy ||
-                            (progress.gate.kind === "question" &&
-                              !feedback.trim())}
-                          onclick={() => control("respond", true)}
-                          >{progress.gate.kind === "command"
-                            ? "Allow command"
-                            : progress.gate.kind === "plan"
-                              ? "Approve plan"
-                              : "Send answer"}<ArrowRight size={15} /></button
-                        >
-                      </div>
-                    </section>{/if}
-                  {#if messageDraft}
+                  {#if messageDraft && active.dispatch === "submitted"}
                     <form
                       class="message-composer"
                       aria-label="Task conversation"
@@ -1681,7 +1918,7 @@
                             : !active.live
                               ? "Reconnect to boltzmann to send. Your draft is saved in this browser."
                               : progress?.gate
-                                ? "Respond to the approval or question above first. You can draft your next message here."
+                                ? "Use the action bar at the top to respond first. You can draft your next message here."
                                 : progress?.status === "paused"
                                   ? "Resume or stop the current message before sending. Your draft is saved."
                                   : !active.can_message
@@ -1816,7 +2053,10 @@
                               ? "PASS"
                               : "FAIL"}</span
                         ><code>{check.command}</code><span
-                          >exit {check.exit_code}</span
+                          >exit {check.exit_code}{#if check.duration_ms}
+                            · {(check.duration_ms / 1000).toFixed(
+                              1,
+                            )}s{/if}</span
                         >
                       </div>
                       <pre>{check.output}</pre>
@@ -1934,7 +2174,19 @@
                   <span class="eyebrow">WORKSPACE</span><code
                     class="workspace-path"
                     >{active.workspace ?? "Preparing…"}</code
-                  >{#if project?.github_url}<a
+                  >{#if active.sandbox_environment}<p class="state-caption">
+                      {active.sandbox_environment.source === "override"
+                        ? "Configured environment"
+                        : active.sandbox_environment.source === "fallback"
+                          ? "General-purpose environment"
+                          : "Automatically selected"}: {active
+                        .sandbox_environment.source === "fallback"
+                        ? "E2B base"
+                        : active.sandbox_environment.label}
+                    </p>
+                    <p class="state-caption">
+                      {active.sandbox_environment.reason}
+                    </p>{/if}{#if project?.github_url}<a
                       class="text-button"
                       href={project.github_url}
                       target="_blank"
@@ -1950,6 +2202,58 @@
     </div>
   </div>
 {/if}
+
+<RepositoryDialog
+  bind:this={repositoryDialog}
+  projects={workspaceProjects}
+  onconnect={repositoryConnected}
+/>
+
+<dialog
+  class="delete-dialog"
+  bind:this={removeRepositoryDialog}
+  aria-labelledby="remove-repository-title"
+  aria-describedby="remove-repository-description"
+  oncancel={(event) => {
+    if (removingRepository) event.preventDefault();
+  }}
+  onclose={() => {
+    repositoryToRemove = null;
+  }}
+>
+  <h2 id="remove-repository-title">Remove repository?</h2>
+  <p class="delete-task-name">{repositoryToRemove?.name}</p>
+  <p id="remove-repository-description">
+    This hides the repository and its tasks from boltzmann. Your files, task
+    history, and sandboxes are kept. Running tasks keep running.
+  </p>
+  <p class="delete-note">
+    Add the same folder again to restore its task history.
+  </p>
+  {#if active?.project_id === repositoryToRemove?.id && fileText !== originalText}
+    <p class="delete-note">
+      Unsaved changes in the task file editor will be discarded.
+    </p>
+  {/if}
+  {#if removeRepositoryError}<p class="delete-error" role="alert">
+      {removeRepositoryError}
+    </p>{/if}
+  <div class="dialog-actions">
+    <button
+      disabled={removingRepository}
+      onclick={() => removeRepositoryDialog?.close()}>Cancel</button
+    >
+    <button
+      class="danger"
+      disabled={removingRepository}
+      onclick={removeRepository}
+    >
+      <Trash2 size={14} />{removingRepository
+        ? "Removing…"
+        : "Remove repository"}
+    </button>
+  </div>
+</dialog>
 
 <dialog
   class="delete-dialog merge-dialog"

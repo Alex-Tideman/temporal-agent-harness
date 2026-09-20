@@ -26,7 +26,27 @@ export interface Project {
   name: string;
   path: string;
   github_url: string;
+  last_opened?: number;
   demo?: boolean;
+}
+export interface RepositoryDiscovery {
+  folder: string;
+  display_path: string;
+  suggestions: {
+    name: string;
+    path: string;
+    display_path: string;
+    connected_id: string;
+  }[];
+  truncated: boolean;
+  warning: string;
+}
+export interface FolderListing {
+  path: string;
+  display_path: string;
+  parents: { name: string; path: string }[];
+  folders: { name: string; path: string; repository: boolean }[];
+  truncated: boolean;
 }
 export interface State {
   engine?: string;
@@ -84,6 +104,7 @@ export interface State {
     stale: boolean;
     revision?: string;
     after_revision?: string;
+    duration_ms?: number;
   }[];
   files_changed: string[];
   outcome: string;
@@ -107,8 +128,19 @@ export interface Task {
   profile_id: string;
   input?: { prompt: string; profile: Profile };
   preparation_error?: string;
+  preparation_running?: boolean;
   dispatch_error?: string;
   workspace?: string;
+  workspace_backend?: "e2b" | "local";
+  sandbox_id?: string;
+  sandbox_template?: string;
+  sandbox_environment?: {
+    template: string;
+    label: string;
+    source: "automatic" | "override" | "fallback";
+    reason: string;
+  };
+  preparation_ms?: number;
   base_commit?: string;
   source_dirty?: boolean;
   dispatch: string;
@@ -186,6 +218,8 @@ export interface Home {
     harness_version: string;
     data_dir: string;
     execution: string;
+    sandbox_ready: boolean;
+    sandbox_template: string;
     milestone: string;
   };
 }

@@ -10,6 +10,7 @@ dependencies = [
   # This Pydantic AI release uses httpx; Anthropic 1.x switched to httpx2.
   "anthropic==0.108.0",
   "keyring>=25.6,<26",
+  "e2b>=2.46.4,<3",
 ]
 
 [project.scripts]

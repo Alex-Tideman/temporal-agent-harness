@@ -519,7 +519,7 @@ class SdlcAgentWorkflow:
                     answer = await self.gate(
                         identity,
                         "command",
-                        "Allow this command on your computer?",
+                        "Allow this command in the task workspace?",
                         shlex.join(action.argv),
                     )
                     if not answer.approved:

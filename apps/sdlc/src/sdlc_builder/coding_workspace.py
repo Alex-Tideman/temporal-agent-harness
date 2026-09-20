@@ -4,6 +4,7 @@ import asyncio
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from temporalio import activity
 
+from . import previews
 from . import workspaces as ws
 from .coding_models import (
     FileChange,
@@ -22,58 +24,11 @@ from .coding_models import (
     ToolCall,
     ToolResult,
 )
+from .sandbox import call as sandbox_call
+from .sandbox import is_remote
 from .store import Store, data_dir, workspace
 
-
-def revision(root: Path) -> str:
-    # No UI 3,000-file cap: incomplete snapshots must never count as verified.
-    names = sorted(
-        set(
-            ws.git(
-                root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"
-            ).split("\0")
-        )
-        - {""}
-    )
-    if len(names) > 50000:
-        raise ValueError("Repository exceeds the 50,000-file verification limit")
-    digest = hashlib.sha256()
-    total = 0
-    for name in names:
-        if not ws.allowed(name):
-            continue
-        path = root / name
-        # Include symlink identity, deleted files, modes and binary/large files,
-        # without following symlinks or exposing their contents to the model.
-        if any(
-            p.is_symlink()
-            for p in [path, *path.parents]
-            if p != root and p.is_relative_to(root)
-        ):
-            raw = (
-                ("symlink:" + os.readlink(path)).encode()
-                if path.is_symlink()
-                else b"symlink-parent"
-            )
-        elif path.is_file():
-            size = path.stat().st_size
-            total += size
-            if total > 256_000_000:
-                raise ValueError(
-                    "Repository exceeds the 256 MB verification snapshot limit"
-                )
-            raw = path.read_bytes()
-        else:
-            raw = b"deleted"
-        mode = (
-            str(path.lstat().st_mode)
-            if path.exists() or path.is_symlink()
-            else "missing"
-        )
-        digest.update(
-            json.dumps([name, mode, hashlib.sha256(raw).hexdigest()]).encode()
-        )
-    return digest.hexdigest()
+revision = ws.remote_capable(ws.runtime.revision)
 
 
 def patch_files(root: Path, changes: list[FileChange]) -> list[str]:
@@ -214,6 +169,7 @@ async def project_merge_operation(
 async def coding_operation(
     task_id: str, operation_id: str, call: ToolCall
 ) -> ToolResult:
+    started = time.monotonic()
     root = workspace(task_id)
     if not operation_id.replace("-", "").isalnum():
         raise ValueError("Invalid operation ID")
@@ -221,15 +177,21 @@ async def coding_operation(
     journal.mkdir(parents=True, exist_ok=True, mode=0o700)
     record = journal / f"{operation_id}.json"
     fingerprint = hashlib.sha256(call.model_dump_json().encode()).hexdigest()
+    fingerprints = {fingerprint}
+    if not call.paths:
+        # Histories/journals written before batched reads had no paths field.
+        fingerprints.add(
+            hashlib.sha256(call.model_dump_json(exclude={"paths"}).encode()).hexdigest()
+        )
     previous = json.loads(record.read_text()) if record.exists() else {}
     if previous:
-        if previous["fingerprint"] != fingerprint:
+        if previous["fingerprint"] not in fingerprints:
             return ToolResult(
                 ok=False, error="Operation ID reused with different arguments"
             )
         if "result" in previous:
             return ToolResult.model_validate(previous["result"])
-        if call.kind == "check":
+        if call.kind in {"check", "preview"}:
             return ToolResult(
                 ok=False,
                 error="Command outcome is unknown after interruption; it was not run twice. Request a new verification run.",
@@ -244,6 +206,13 @@ async def coding_operation(
             result.file = FileView.model_validate(
                 await asyncio.to_thread(ws.read_file, root, call.path)
             )
+        elif call.kind == "read_many":
+            result.views = [
+                FileView.model_validate(view)
+                for view in await asyncio.to_thread(
+                    ws.remote_capable(ws.runtime.read_many), root, call.paths
+                )
+            ]
         elif call.kind == "search":
             result.matches = [
                 SearchHit.model_validate(hit)
@@ -284,24 +253,74 @@ async def coding_operation(
                     ]
                 entry["changes"] = [c.model_dump() for c in changes]
                 save_record(record, entry)
-            result.before_revision = await asyncio.to_thread(revision, root)
-            result.files = await asyncio.to_thread(patch_files, root, changes)
-            result.revision = await asyncio.to_thread(revision, root)
+            if is_remote(root):
+                changed = await asyncio.to_thread(
+                    sandbox_call,
+                    root,
+                    "patch_operation",
+                    [c.model_dump() for c in changes],
+                )
+                result.before_revision, result.files, result.revision = (
+                    changed["before_revision"],
+                    changed["files"],
+                    changed["revision"],
+                )
+            else:
+                result.before_revision = await asyncio.to_thread(revision, root)
+                result.files = await asyncio.to_thread(patch_files, root, changes)
+                result.revision = await asyncio.to_thread(revision, root)
         elif call.kind == "revision":
             result.revision = await asyncio.to_thread(revision, root)
-        elif call.kind == "check":
-            result.before_revision = await asyncio.to_thread(revision, root)
-            if result.before_revision != call.expected_revision:
-                raise ValueError(
-                    "Workspace changed after command approval. Review and approve the new revision."
-                )
-            checked = await ws.execute_check(root, call.argv)
-            result.exit_code, result.output = checked["exit_code"], checked["output"]
+        elif call.kind == "preview":
+            try:
+                preview = await previews.verify(root, restart=call.query == "restart")
+            except ValueError as error:
+                preview = {"ok": False, "detail": str(error)}
+            except Exception as error:
+                preview = {
+                    "ok": False,
+                    "detail": f"Could not verify the sandbox preview ({type(error).__name__})",
+                }
+            result.ok = preview["ok"]
+            result.error = "" if result.ok else preview.get("detail", "Preview failed")
+            # Bound model-visible logs separately from the UI's full log tail.
+            preview["logs"] = preview.get("logs", "")[-8000:]
+            result.output = json.dumps(preview)
             result.revision = await asyncio.to_thread(revision, root)
+        elif call.kind == "check":
+            if is_remote(root):
+                checked = await asyncio.to_thread(
+                    sandbox_call,
+                    root,
+                    "check_operation",
+                    call.argv,
+                    call.expected_revision,
+                )
+                result.before_revision, result.revision = (
+                    checked["before_revision"],
+                    checked["revision"],
+                )
+            else:
+                result.before_revision = await asyncio.to_thread(revision, root)
+                if result.before_revision != call.expected_revision:
+                    raise ValueError(
+                        "Workspace changed after command approval. Review and approve the new revision."
+                    )
+                checked = await ws.execute_check(root, call.argv)
+                result.revision = await asyncio.to_thread(revision, root)
+            result.exit_code, result.output = checked["exit_code"], checked["output"]
         else:
             raise ValueError("Unsupported coding operation")
     except (ValueError, OSError, UnicodeError) as error:
         result.ok, result.error = False, str(error)[:1000]
+    result.duration_ms = round((time.monotonic() - started) * 1000)
+    logging.getLogger(__name__).info(
+        "coding_operation task=%s kind=%s duration_ms=%d ok=%s",
+        task_id,
+        call.kind,
+        result.duration_ms,
+        result.ok,
+    )
     entry["result"] = result.model_dump(mode="json")
     save_record(record, entry)
     return result

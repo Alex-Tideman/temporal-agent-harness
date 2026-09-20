@@ -14,6 +14,12 @@ class FileRequest(BaseModel):
     path: str
 
 
+class FilesRequest(BaseModel):
+    """Read related source files in one workspace operation."""
+
+    paths: list[str] = Field(min_length=1, max_length=20)
+
+
 class SearchRequest(BaseModel):
     """Find literal text in repository files."""
 
@@ -103,12 +109,14 @@ class ToolResult(BaseModel):
     operation_id: str = ""
     files: list[str] = Field(default_factory=list)
     file: FileView | None = None
+    views: list[FileView] = Field(default_factory=list)
     matches: list[SearchHit] = Field(default_factory=list)
     patch: str = ""
     revision: str = ""
     before_revision: str = ""
     exit_code: int | None = None
     output: str = ""
+    duration_ms: int = 0
 
 
 class ToolCall(BaseModel):
@@ -117,16 +125,19 @@ class ToolCall(BaseModel):
     kind: Literal[
         "list",
         "read",
+        "read_many",
         "search",
         "diff",
         "revision",
         "patch",
         "edit",
         "check",
+        "preview",
         "model",
         "usage",
     ]
     path: str = ""
+    paths: list[str] = Field(default_factory=list, max_length=20)
     query: str = ""
     changes: list[FileChange] = Field(default_factory=list)
     edit: EditRequest | None = None
@@ -209,6 +220,7 @@ class Actor(HarnessState):
 class Evidence(Check):
     revision: str = ""
     after_revision: str = ""
+    duration_ms: int = 0
 
 
 class CodingState(SdlcState):

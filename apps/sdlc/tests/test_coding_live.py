@@ -60,10 +60,18 @@ async def assert_role_traces(address, workflow_id, payload_dir):
 def test_coding_v2_lifecycle(tmp_path):
     port, temporal_port = free_port(), free_port()
     requests = []
+    first_request = threading.Event()
+    release_first_request = threading.Event()
 
     class Provider(BaseHTTPRequestHandler):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if not first_request.is_set():
+                # Exercise shutdown while a real SDK stream activity is waiting
+                # for its provider. Temporal must retry it on the next launch.
+                first_request.set()
+                release_first_request.wait(timeout=30)
+                return
             requests.append(body)
             role = next(
                 r
@@ -234,6 +242,15 @@ def test_coding_v2_lifecycle(tmp_path):
             },
         )
         assert task["engine"] == "v2"
+        assert first_request.wait(timeout=15)
+        stop()
+        release_first_request.set()
+        shutdown_log = (tmp_path / "app.log").read_text()
+        assert "ignored GeneratorExit" not in shutdown_log, shutdown_log[-8000:]
+        assert "was created in a different Context" not in shutdown_log, shutdown_log[
+            -8000:
+        ]
+        launch()
         path = "/api/tasks/" + task["id"]
 
         def read():
@@ -449,6 +466,7 @@ def test_coding_v2_lifecycle(tmp_path):
         deleted = client.delete(path)
         assert deleted.status_code == 200, deleted.text
     finally:
+        release_first_request.set()
         stop()
         provider.shutdown()
         provider.server_close()
