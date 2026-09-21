@@ -113,7 +113,15 @@ def remote_call(client, meta: dict, operation: str, *args):
         now = time.monotonic()
         if now - _last_extension.get(client.sandbox_id, 0) >= 60:
             # connect resumes paused VMs and only extends a running timeout.
-            client.connect(timeout=sandbox.IDLE_TIMEOUT)
+            try:
+                client.connect(timeout=sandbox.IDLE_TIMEOUT)
+            except Exception:
+                # A cached SDK object can outlive its transport (for example
+                # after an ownership handoff or an idle auto-pause). Reattach
+                # to the persisted sandbox ID before giving up. This only
+                # retries the connection, never the remote operation, so a
+                # lost write cannot be replayed accidentally.
+                client = sandbox._client(meta, refresh=True)
             _last_extension[client.sandbox_id] = now
     return sandbox._rpc(
         client, operation, list(args), remote_root=meta["remote_root"], shared=True
@@ -143,6 +151,8 @@ def checkpoint(root: Path, client=None, meta=None) -> dict:
         meta["sandbox_base"],
         previous.get("revision", ""),
     )
+    # remote_call may have replaced a stale SDK transport during reattachment.
+    client = sandbox._client(meta)
     if info.get("unchanged"):
         return {"revision": previous["revision"], "saved_at": previous["saved_at"]}
     destination = artifacts(root.name)
@@ -247,7 +257,14 @@ def _create(project: dict):
     return client
 
 
-def prepare(project_id: str, source: str, task_id: str, parent_id: str = "") -> dict:
+def prepare(
+    project_id: str,
+    source: str,
+    task_id: str,
+    parent_id: str = "",
+    *,
+    seed: dict | None = None,
+) -> dict:
     started = time.monotonic()
     root = workspace(task_id)
     with project_lock(project_id):
@@ -257,9 +274,15 @@ def prepare(project_id: str, source: str, task_id: str, parent_id: str = "") -> 
             if meta.get("project_id") != project_id:
                 raise ValueError("Task already has a different workspace")
         else:
-            base = runtime.git(Path(source), "rev-parse", "HEAD").strip()
-            archive = sandbox.source_archive(Path(source), base)
-            patch = ""
+            base = (
+                seed["base"]
+                if seed
+                else runtime.git(Path(source), "rev-parse", "HEAD").strip()
+            )
+            archive = (
+                seed["archive"] if seed else sandbox.source_archive(Path(source), base)
+            )
+            patch = seed["patch"] if seed else ""
             if parent_id:
                 from . import workspaces
 

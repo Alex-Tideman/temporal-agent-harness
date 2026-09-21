@@ -122,25 +122,7 @@ def merge_to_project(
 
     # Remote outputs are untrusted. Validate each patch's actual paths on the
     # host before git apply can mutate the source checkout.
-    for name, patch in entries:
-        inspected = git_apply(source_root, patch, "--numstat", "-z")
-        records = [
-            record.split("\t", 2) for record in inspected.stdout.split("\0") if record
-        ]
-        if (
-            inspected.returncode
-            or len(records) != 1
-            or len(records[0]) != 3
-            or records[0][2] != name
-            or not all(n.isdigit() for n in records[0][:2])
-            or any(
-                line in {"new file mode 120000", "new mode 120000"}
-                for line in patch.splitlines()
-            )
-        ):
-            raise ValueError(
-                "The task returned an unsupported patch. Nothing was changed."
-            )
+    validate_patch_entries(source_root, entries)
 
     pending = []
     already_present = []
@@ -179,6 +161,30 @@ def merge_to_project(
         "branch": git(source_root, "branch", "--show-current").strip()
         or "detached HEAD",
     }
+
+
+def validate_patch_entries(source_root: Path, entries):
+    """Validate sandbox-supplied paths before any host Git mutation."""
+    for name, patch in entries:
+        safe_path(source_root, name)
+        inspected = git_apply(source_root, patch, "--numstat", "-z")
+        records = [
+            record.split("\t", 2) for record in inspected.stdout.split("\0") if record
+        ]
+        if (
+            inspected.returncode
+            or len(records) != 1
+            or len(records[0]) != 3
+            or records[0][2] != name
+            or not all(n.isdigit() for n in records[0][:2])
+            or any(
+                line in {"new file mode 120000", "new mode 120000"}
+                for line in patch.splitlines()
+            )
+        ):
+            raise ValueError(
+                "The task returned an unsupported patch. Nothing was changed."
+            )
 
 
 def continue_workspace(parent_id: str, task_id: str) -> dict:

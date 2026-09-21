@@ -486,6 +486,26 @@ async def test_lost_remote_command_reply_is_not_repeated(remote, monkeypatch):
     assert (client.translate(sandbox.REMOTE_ROOT) / "counter").read_text() == "x"
 
 
+def test_acceptance_revision_read_reattaches_after_transport_failure(remote, monkeypatch):
+    _, prepared, root = make_task(remote)
+    expected = revision(root)
+    original = sandbox._rpc
+    calls = 0
+
+    def interrupted(client, operation, args, **kwargs):
+        nonlocal calls
+        if operation == "revision":
+            calls += 1
+            if calls == 1:
+                raise ConnectionError("stale transport")
+        return original(client, operation, args, **kwargs)
+
+    monkeypatch.setattr(sandbox, "_rpc", interrupted)
+    assert revision(root) == expected
+    assert calls == 2 and remote.connected[-1] == prepared["sandbox_id"]
+    assert len(remote.created) == 1
+
+
 def test_merge_rejects_patch_paths_misreported_by_sandbox(remote, monkeypatch):
     source, prepared, root = make_task(remote)
     for name in ("greeting.py", "README.md"):

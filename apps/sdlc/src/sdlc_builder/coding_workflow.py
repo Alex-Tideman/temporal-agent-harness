@@ -243,6 +243,14 @@ class CodingWorkflow(SdlcAgentWorkflow):
                     return {"ok": False, "error": fresh.error}
                 self.observe_revision(fresh.revision)
                 if (
+                    self.current_task.integration_run
+                    and self.state.current.verification != "verified"
+                ):
+                    return {
+                        "ok": False,
+                        "error": "Integration requires passing checks and independent review for the current revision. Send a follow-up to fix the remaining findings.",
+                    }
+                if (
                     self.state.current.verification != "verified"
                     and not request.text.strip()
                 ):
@@ -595,13 +603,17 @@ class CodingWorkflow(SdlcAgentWorkflow):
         self.observe_revision(fresh.revision)
         if not blueprint.checks:
             return []
-        response = await self.gate(
-            workflow.uuid4().hex,
-            "command",
-            "Approve verification commands",
-            "Run at the task workspace root with a scrubbed environment. These commands may execute repository code.\n\n"
-            + "\n".join(shlex.join(c.argv) for c in blueprint.checks)
-            + f"\n\nSource revision: {fresh.revision}",
+        response = (
+            Control(command="respond", approved=True)
+            if self.current_task.integration_run
+            else await self.gate(
+                workflow.uuid4().hex,
+                "command",
+                "Approve verification commands",
+                "Run at the task workspace root with a scrubbed environment. These commands may execute repository code.\n\n"
+                + "\n".join(shlex.join(c.argv) for c in blueprint.checks)
+                + f"\n\nSource revision: {fresh.revision}",
+            )
         )
         if not response.approved:
             return []
@@ -636,6 +648,8 @@ class CodingWorkflow(SdlcAgentWorkflow):
 
     def begin_turn(self, task: TaskInput, message_id: str) -> list[dict[str, str]]:
         """Transition into a turn while holding the workspace-operation lock."""
+        if self.current_task and self.current_task.integration_run:
+            task.integration_run = True
         self.current_task = task
         self.paused = self.cancelled = False
         self.response = None
@@ -785,19 +799,27 @@ class CodingWorkflow(SdlcAgentWorkflow):
                 state.blueprints.append(blueprint)
                 state.risks = plan.risks
             self.stage("plan")
-            answer = await self.gate(
-                workflow.uuid4().hex,
-                "plan",
-                "Approve this blueprint",
-                plan.summary
-                + "\n\nRequirements:\n"
-                + "\n".join(plan.requirements)
-                + "\n\nAssumptions:\n"
-                + "\n".join(plan.assumptions)
-                + "\n\nWrite scope:\n"
-                + "\n".join(plan.scope)
-                + "\n\nProposed checks (separate execution approval):\n"
-                + "\n".join(shlex.join(c.argv) for c in plan.checks),
+            answer = (
+                Control(
+                    command="respond",
+                    approved=True,
+                    text="Integration preparation authorized when this batch was queued; final code requires human acceptance.",
+                )
+                if task.integration_run and initial
+                else await self.gate(
+                    workflow.uuid4().hex,
+                    "plan",
+                    "Approve this blueprint",
+                    plan.summary
+                    + "\n\nRequirements:\n"
+                    + "\n".join(plan.requirements)
+                    + "\n\nAssumptions:\n"
+                    + "\n".join(plan.assumptions)
+                    + "\n\nWrite scope:\n"
+                    + "\n".join(plan.scope)
+                    + "\n\nProposed checks (separate execution approval):\n"
+                    + "\n".join(shlex.join(c.argv) for c in plan.checks),
+                )
             )
             if not answer.approved:
                 return self.finish(

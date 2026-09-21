@@ -20,6 +20,8 @@ import time
 import uuid
 from pathlib import Path
 
+import httpx
+
 from . import sandbox_templates
 from . import workspace_runtime as runtime
 from .store import data_dir, workspace
@@ -89,11 +91,13 @@ def _install(client):
     client.files.write(path, source)
 
 
-def _client(meta: dict):
+def _client(meta: dict, *, refresh: bool = False):
     identity = meta["sandbox_id"]
     # Reuse the SDK transport. E2B auto-resume handles idle sandboxes; after an
     # app restart connect resumes the saved ID instead of creating an empty VM.
     with _lock:
+        if refresh:
+            _clients.pop(identity, None)
         if identity not in _clients:
             client = _sdk().connect(identity, timeout=IDLE_TIMEOUT)
             _install(client)
@@ -152,6 +156,18 @@ def call(root: Path, operation: str, *args):
     except ValueError:
         raise
     except Exception as error:
+        if operation == "revision" and isinstance(
+            error, (httpx.TransportError, ConnectionError, TimeoutError)
+        ):
+            # Acceptance only reads the source hash. Reconnect to the same VM
+            # and retry this safe read once; writes and commands remain at-most-once.
+            try:
+                client = _client(meta, refresh=True)
+                if meta.get("project_id"):
+                    return project_workspaces.call(root, operation, args)
+                return _rpc(client, operation, args)
+            except Exception as retry_error:
+                error = retry_error
         # No automatic re-execution: a transport failure after a command/write
         # may have an unknown outcome. Activity journals preserve that boundary.
         raise ValueError(

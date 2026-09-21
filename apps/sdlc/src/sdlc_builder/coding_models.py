@@ -133,6 +133,7 @@ class ToolCall(BaseModel):
         "edit",
         "check",
         "preview",
+        "integration",
         "coordinate",
         "model",
         "usage",

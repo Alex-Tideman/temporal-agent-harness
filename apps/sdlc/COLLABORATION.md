@@ -42,7 +42,7 @@ Comments show their author and resolver. File checkpoints belong to each reviewe
 
 A managed GitHub checkout fetches its default branch before new tasks; maintainers can also sync it in Settings. Only a clean checkout on the configured branch is fast-forwarded. Local edits or diverging history stop the sync and preserve the checkout. Task sandboxes are seeded from the committed project state.
 
-**Merge into project currently applies accepted changes as uncommitted edits in the server's checkout.** It does not create a Git commit, push a branch, or open a pull request. After merging, the operator must commit/export those changes before another GitHub sync can proceed. Merge receipts and per-project locks retain the existing protections against overlapping patches. This is the same merge behavior as local mode; stage 3 replaces it with the reviewed integration queue.
+Shared worktree tasks use the Stage 3 integration queue below. **Merge into project for legacy/local tasks still applies accepted changes as uncommitted edits in the server's checkout.** That older action does not create a commit or publish a pull request; the operator must commit/export those changes before another GitHub sync. Shared task merge endpoints reject direct checkout writes and direct users to integration.
 
 ### Verification
 
@@ -76,25 +76,46 @@ Checkpoints retain allowed regular source files, untracked source files, deletio
 
 To recover, finish or stop all project tasks, then open **Coordinate → Sandbox → Recover sandbox** as a maintainer/owner. The confirmation explains the project-wide effect and missing runtime data. The server verifies that every task is idle, checks the recovery artifacts, and confirms the old VM is gone before replacing it. Workflows remain blocked until all worktrees are restored and previous checks/acceptance have been invalidated. Retrying an unfinished recovery reuses its replacement and receipts; it does not overwrite a completed, subsequently changed worktree. Old preview URLs are discarded. Send a follow-up to reinstall dependencies, rerun checks, and restart previews. If the worker cannot confirm that tasks have stopped, recovery waits for connectivity.
 
-Worktrees share a filesystem, Git object store, network, and process environment. They are **not a security boundary between untrusted contributors**: approved repository code can access the project's VM. Keep different trust groups in separate projects/sandboxes. Stage 3 will add reviewed integration; Stage 2 does not merge peers' branches automatically or publish to GitHub.
+Worktrees share a filesystem, Git object store, network, and process environment. They are **not a security boundary between untrusted contributors**: approved repository code can access the project's VM. Keep different trust groups in separate projects/sandboxes. Stage 3 adds reviewed integration without changing this trust boundary.
 
 ### Stage 2 acceptance checklist
 
 1. Start two new tasks in one shared project, using two developer accounts. Their sandbox ID should match; branches, workspace paths, owners, and preview ports should differ.
 2. Edit the same source file in both. Each review must show only that task's changes, and Coordinate should show the overlap. Send a note and confirm its author and incoming/outgoing direction from the other task.
 3. Verify both web previews. They must serve their own code concurrently. Stop/delete one; the other must remain available.
-4. Try operating the other developer's task. Plan/command approvals, edits, previews, and follow-ups should be unavailable until handoff. A maintainer should still be able to accept/merge a reviewed task.
+4. Try operating the other developer's task. Plan/command approvals, edits, previews, and follow-ups should be unavailable until handoff. A maintainer should still be able to accept a reviewed task and queue it for integration.
 5. Finish/stop a task, hand it off, and confirm the new owner can continue while the former owner retains review access. Repeated/stale handoff requests must be rejected.
 6. Stop all tasks, save changes, and recover the project sandbox. Source revisions should be preserved, previews should be stopped, checks should be stale, and a previously accepted task should require renewed acceptance. Recovery while a task is active must be refused.
 
 Automated tests use real Git worktrees and preview processes behind a local E2B transport double, plus API account/ownership tests and Temporal workflow tests. They do not establish E2B service availability; the real-cloud smoke tests are explicitly opt-in.
 
-## Stage 3 — reviewed integration (planned)
+## Stage 3 — reviewed integration (implemented)
 
-- A per-project merge queue creates a temporary integration worktree from the current target branch.
-- The coordinator applies approved revisions, runs combined checks, and prepares an integration preview.
-- Agents propose conflict repairs with attributed diffs; changed code requires renewed review.
-- Human approval binds to the exact tested integration revision before publication.
-- GitHub branch/PR publication, CI feedback, target-branch freshness checks, and recovery receipts.
+Select a repository in shared mode and open **Integration queue** in the top bar. Maintainers select accepted coding tasks and choose **Queue & test**. The server records immutable patches, source revisions, requirements, and authors; later edits to the source tasks cannot change the queued batch. Task versions and actual source hashes must match at capture. Inputs are bounded to twenty tasks, 500 KB of text per task, and 1 MB combined. Unsupported/binary/excluded changes fail capture instead of silently disappearing.
 
-Individual task verification remains distinct from integration verification: two passing tasks can still conflict when combined.
+The first pending batch prepares automatically; later batches wait until it is published, cancelled, or rebuilt. Preparation fetches the configured GitHub target branch (or reads the local target), records its commit, and applies supported patches to a sanitized temporary checkout using only Git primitives. Conflicting file patches remain separate and attributed. The resulting seed is imported into a new worktree in the project's E2B sandbox, with its own branch, preview port, writer lease, and checkpoint. The server never runs repository installation/build/test scripts, and its managed checkout is not changed.
+
+The integration is a normal durable Coding V2 task. Its coordinator and implementer can use **read_integration_input** to compare each accepted patch and its author, resolve conflicts in the integration worktree, install dependencies, run combined checks, and start the integration preview. Queueing authorizes initial integration planning and sandbox verification; follow-up blueprint changes still use the task's existing approval flow. The independent reviewer inspects the full combined diff. Source acceptance does not approve repairs or substitute for combined verification.
+
+**Review required** stays visible above the queue's scrolling content. Open the integration task to inspect its code, findings, check receipts, and Preview tab. Accepting an integration requires successful verification and independent review for its current source hash; an acceptance note cannot waive failed/stale checks. Changes or sandbox recovery invalidate that evidence. The task owner can send a follow-up to repair problems; maintainers can review and accept after an ownership handoff.
+
+### Publication and CI
+
+After acceptance, choose **Open pull request** in the integration queue. This is an explicit publication action. The server checks the current workflow version, accepted source hash, verification/review revision, and target branch again. A moved target marks the batch stale; **Rebuild on latest target** creates another integration from the same immutable inputs, with fresh verification and acceptance. Existing reviews are preserved.
+
+Publication creates a commit parented to the real target commit using a private Git index. It preserves target history and files excluded from the sandbox, applies only validated text patches, and stores the resulting commit plus approver before network delivery. The server creates a unique `boltzmann/integration-<id>` GitHub branch and opens a pull request. Retrying an uncertain response reconciles that same branch, commit, and PR; an existing branch with different contents is never overwritten. Editing is blocked once publication starts. **Check GitHub CI** shows commit statuses and check runs tied to the published commit, and indicates if the PR head or target moved. Large check lists are explicitly marked incomplete. Final merging happens on GitHub, under the repository's own branch protection and CI rules.
+
+The operator's `SDLC_GITHUB_TOKEN` needs **Contents: read/write**, **Pull requests: read/write**, and access to read checks/statuses for the connected repository. Changes to workflow files may require GitHub's additional workflow permission. Tokens stay on the app server and are never sent into E2B. Projects imported only by local path can run integration checks/previews, but GitHub publication requires a GitHub-connected repository.
+
+### Durability and test checklist
+
+Back up `integrations/` together with the existing store and workspace checkpoints. Queue mutations use a per-project OS lock and atomic journal replacement. Preparation and task dispatch resume from saved inputs and workspace receipts after server restart. An ambiguous failure stops with a visible retry action; it does not recreate an empty sandbox or repeat an uncertain repository command. Published/cancelled integration tasks are retained as review history.
+
+1. Accept two shared tasks, select both in **Integration queue**, and choose **Queue & test**. Confirm a third integration task appears automatically with its own worktree and preview.
+2. Edit a source task after queueing; confirm the integration still uses the originally captured patch. Try queueing an unaccepted/stale revision and verify rejection.
+3. Queue conflicting changes. Open the integration task, inspect the agent's repair and combined evidence, then review the preview. Failed checks must block acceptance even with a note.
+4. Accept the verified integration and open its PR. Confirm the PR contains the reviewed changes, while the server checkout remains unchanged. Refresh GitHub CI and compare its reported commit.
+5. Move the target branch before publication. The batch must require rebuilding and renewed review. Retry a publication with a lost response and confirm no duplicate branch/PR appears.
+6. Repeat with a viewer/developer account: queueing, cancellation, rebuilding, and publication require a maintainer/owner. Ordinary task ownership rules still govern repair and follow-up work.
+
+Automated coverage uses real Git/E2B transport doubles for immutable capture, conflicts, queue ordering, idempotency, exact commit construction, stale targets, publication recovery, access controls, and acceptance gates. GitHub calls are mocked and real E2B availability is not established by these tests. Individual task verification remains distinct from integration verification: two passing tasks can still conflict when combined.

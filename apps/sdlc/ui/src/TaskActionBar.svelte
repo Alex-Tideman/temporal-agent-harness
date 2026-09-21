@@ -50,13 +50,30 @@
       ),
   );
   let label = $derived(
-    taskAttention(task) || (mergeReady ? "Merge accepted changes" : ""),
+    taskAttention(task) ||
+      (mergeReady
+        ? task.workspace_layout === "project-worktree"
+          ? task.integration_id
+            ? "Publish reviewed integration"
+            : "Integrate accepted changes"
+          : "Merge accepted changes"
+        : ""),
   );
   let needsNote = $derived(
     progress?.engine === "v2" &&
       progress.status === "review" &&
       progress.mode === "change" &&
+      !task.integration_id &&
       progress.verification !== "verified",
+  );
+  let integrationBlocked = $derived(
+    !!task.integration_id &&
+      progress?.status === "review" &&
+      progress.verification !== "verified",
+  );
+  let sandboxUnavailable = $derived(
+    error.includes("E2B workspace unavailable") ||
+      error.includes("shared E2B sandbox is unavailable"),
   );
   let disabled = $derived(busy || !task.live || task.can_control === false);
   let dialog = $state<HTMLDialogElement>();
@@ -108,7 +125,13 @@
       dialog?.close();
   }
   async function accept() {
-    if (busy || !task.live || task.can_accept === false || !task.can_message)
+    if (
+      busy ||
+      !task.live ||
+      task.can_accept === false ||
+      !task.can_message ||
+      integrationBlocked
+    )
       return;
     if (needsNote && !feedback.trim()) {
       details();
@@ -178,7 +201,8 @@
           disabled={busy ||
             !task.live ||
             task.can_accept === false ||
-            !task.can_message}
+            !task.can_message ||
+            integrationBlocked}
           onclick={details}
           ><Check size={15} />{progress.mode === "ask"
             ? "Accept answer"
@@ -188,7 +212,10 @@
         <button onclick={onreview}>Review changes</button><button
           class="primary"
           disabled={busy || !task.live || task.can_merge === false}
-          onclick={onmerge}><GitMerge size={15} />Merge into project</button
+          onclick={onmerge}
+          ><GitMerge size={15} />{task.workspace_layout === "project-worktree"
+            ? "Open integration queue"
+            : "Merge into project"}</button
         >
       {/if}
     </div>
@@ -209,6 +236,17 @@
       >
         A project maintainer or owner can accept and merge these changes. You
         can review files and leave comments.
+      </p>{/if}
+    {#if sandboxUnavailable}
+      <p class="action-notice">
+        The sandbox could not be reached to check the latest revision. Retry
+        after reconnecting. If the sandbox is gone, recover it from Coordinate →
+        Sandbox.
+      </p>
+    {/if}
+    {#if integrationBlocked}<p class="action-notice">
+        Combined checks or independent review are incomplete. Send a follow-up
+        to repair the integration before accepting it.
       </p>{/if}
     {#if error}<p class="action-error" role="alert">{error}</p>{/if}
   </section>

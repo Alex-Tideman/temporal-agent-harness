@@ -302,3 +302,18 @@ async def test_workspace_restore_invalidates_acceptance_and_verification():
     with obj.state.mutate() as state:
         state.status = "running"
     assert not (await obj.control(Control(command="workspace_restored")))["ok"]
+
+
+async def test_integration_cannot_accept_incomplete_checks_with_a_note():
+    from sdlc_builder.models import Control
+
+    obj = controller()
+    obj.current_task.integration_run = True
+    obj.operation.return_value = ToolResult(ok=True, revision="e" * 64)
+    with obj.state.mutate() as state:
+        state.status = "review"
+        state.verification = "incomplete"
+        state.revision = state.review_revision = "e" * 64
+    result = await obj.control(Control(command="accept", text="accept the risk"))
+    assert not result["ok"] and "Integration requires passing" in result["error"]
+    assert obj.state.current.status == "review"

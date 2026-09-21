@@ -129,6 +129,8 @@ export interface State {
   } | null;
 }
 export interface Task {
+  integration_id?: string;
+  integration_status?: string;
   workspace_layout?: "project-worktree";
   owner?: Person;
   ownership_version?: number;

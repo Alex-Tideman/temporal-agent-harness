@@ -96,6 +96,10 @@ def merge_project(
             try:
                 store = Store()
                 task = store.get("tasks", task_id)
+                if task.get("workspace_layout") == "project-worktree":
+                    raise ValueError(
+                        "Use the project integration queue to publish shared changes"
+                    )
                 if task.get("engine") != "v2":
                     raise ValueError("Only Coding V2 tasks support project merge")
                 base_revision = task.get("base_commit", "")
@@ -216,7 +220,13 @@ async def _coding_operation(
     save_record(record, entry)
     result = ToolResult(operation_id=operation_id)
     try:
-        if call.kind == "list":
+        if call.kind == "integration":
+            from .integration_queue import input_for
+
+            result.output = json.dumps(
+                await asyncio.to_thread(input_for, task_id, call.query, call.path)
+            )
+        elif call.kind == "list":
             result.files = await asyncio.to_thread(ws.files, root)
             if project_workspaces.shared(root):
                 result.output = json.dumps(

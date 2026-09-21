@@ -39,6 +39,7 @@ from temporalio.worker import Worker
 
 from . import (
     coordination,
+    integration_queue,
     previews,
     project_workspaces,
     remote_repositories,
@@ -117,6 +118,21 @@ class StartPreview(BaseModel):
 class Handoff(BaseModel):
     user_id: str
     expected_ownership_version: int
+
+
+class IntegrationRequest(BaseModel):
+    id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    task_ids: list[str] = Field(min_length=1, max_length=20)
+    expected_versions: dict[str, int]
+    profile_id: str
+
+
+class IntegrationPublication(DecisionVersion):
+    revision: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class RebuildIntegration(BaseModel):
+    id: str = Field(pattern=r"^[a-f0-9]{32}$")
 
 
 class CoordinationNote(BaseModel):
@@ -245,13 +261,45 @@ def create_app() -> FastAPI:
                 return await reconcile_task(app, task)
 
         while True:
-            # One slow task must not delay dispatch/progress for every other task.
             results = await asyncio.gather(
                 *(collect(t["id"]) for t in store.all("tasks"))
             )
             observed = [result for result in results if result is not None]
             if observed:
                 app.state.temporal_ok = all(observed)
+            await asyncio.sleep(1)
+
+    async def reconcile_integrations():
+        async def advance_integration(project_id):
+            async with project_workspace_locks.setdefault(project_id, asyncio.Lock()):
+                queue = integration_queue.load(project_id)
+                item = next(
+                    (
+                        i
+                        for i in queue["items"]
+                        if i["status"] not in integration_queue.TERMINAL
+                    ),
+                    None,
+                )
+                if (
+                    not item
+                    or item["status"] not in {"queued", "preparing"}
+                    or item.get("error")
+                ):
+                    return
+                async with task_locks.setdefault(item["id"], asyncio.Lock()):
+                    try:
+                        await asyncio.to_thread(
+                            integration_queue.prepare, project_id, item["id"]
+                        )
+                    except Exception:
+                        pass  # The queue retains the error and exposes Retry setup.
+
+        while True:
+            # Preparing a VM must not hold up ordinary task progress collection.
+            await asyncio.gather(
+                *(advance_integration(p["id"]) for p in store.all("projects")),
+            )
             await asyncio.sleep(1)
 
     async def reconcile_task(app, task):
@@ -348,12 +396,16 @@ def create_app() -> FastAPI:
             await stack.enter_async_context(harness.router.lifespan_context(harness))
             app.state.temporal_ok = True
             collector = asyncio.create_task(reconcile(app))
+            integration_dispatcher = asyncio.create_task(reconcile_integrations())
             try:
                 yield
             finally:
                 collector.cancel()
+                integration_dispatcher.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await collector
+                with contextlib.suppress(asyncio.CancelledError):
+                    await integration_dispatcher
 
     app = FastAPI(
         title="boltzmann",
@@ -565,10 +617,24 @@ def create_app() -> FastAPI:
             else {}
         )
         recovering = shared_state.get("status") not in {None, "ready"}
+        delivery = (
+            integration_queue.find(
+                integration_queue.load(task["project_id"]), task["integration_id"]
+            )
+            if task.get("integration_id")
+            else {}
+        )
+        frozen = (
+            bool(delivery.get("publication"))
+            or delivery.get("status") in integration_queue.TERMINAL
+        )
         return {
             **task,
             "sandbox_status": shared_state.get("status"),
-            "can_control": bool(writable and host_allowed and owned and not recovering),
+            "can_control": bool(
+                writable and host_allowed and owned and not recovering and not frozen
+            ),
+            "integration_status": delivery.get("status"),
             "can_handoff": bool(
                 writable
                 and (owned or maintain)
@@ -599,6 +665,18 @@ def create_app() -> FastAPI:
 
     def require_writer(task: dict):
         require_available(task)
+        if task.get("integration_id"):
+            delivery = integration_queue.find(
+                integration_queue.load(task["project_id"]), task["integration_id"]
+            )
+            if (
+                delivery.get("publication")
+                or delivery.get("status") in integration_queue.TERMINAL
+            ):
+                raise HTTPException(
+                    409,
+                    "This integration is closed for editing. Start a new batch for further changes.",
+                )
         if (
             team.enabled
             and task.get("workspace_layout") == "project-worktree"
@@ -1060,6 +1138,13 @@ def create_app() -> FastAPI:
             require_writer(task)
             if task.get("dispatch") != "preparing":
                 return task  # A previous retry succeeded; never initialize twice.
+            if task.get("integration_id"):
+                await asyncio.to_thread(
+                    integration_queue.prepare,
+                    task["project_id"],
+                    task["integration_id"],
+                )
+                return task_permissions(store.get("tasks", identity))
             project = store.get("projects", task["project_id"])
             if project.get("removed"):
                 raise HTTPException(
@@ -1244,6 +1329,196 @@ def create_app() -> FastAPI:
                         ),
                     )
             return task_permissions(store.get("tasks", identity))
+
+    @app.get("/api/projects/{project_id}/integration")
+    async def integration_queue_status(project_id: str):
+        team.require(project_id)
+        result = await asyncio.to_thread(integration_queue.list_queue, project_id)
+        result["can_manage"] = team.role(project_id) in {"maintainer", "owner"}
+
+        async def with_task(item):
+            if item.get("task_id"):
+                task = (
+                    await get_task(item["task_id"])
+                    if item["status"] not in integration_queue.TERMINAL
+                    else task_permissions(store.get("tasks", item["task_id"]))
+                )
+                item["task"] = task
+
+        await asyncio.gather(*(with_task(item) for item in result["items"]))
+        return result
+
+    @app.post("/api/projects/{project_id}/integration")
+    async def queue_integration(project_id: str, body: IntegrationRequest):
+        team.require(project_id, "maintainer")
+        if (
+            sandbox.configuration()["backend"] != "e2b"
+            or not sandbox.configuration()["ready"]
+        ):
+            raise HTTPException(
+                409, "Integration requires E2B configuration on the server"
+            )
+        profile = Profile.model_validate(store.get("profiles", body.profile_id))
+        integration_for(profile)
+        async with (
+            project_workspace_locks.setdefault(project_id, asyncio.Lock()),
+            contextlib.AsyncExitStack() as locks,
+        ):
+            for identity in sorted(set(body.task_ids)):
+                if store.get("tasks", identity)["project_id"] != project_id:
+                    raise HTTPException(404, "Task not found in this project")
+                await locks.enter_async_context(
+                    task_locks.setdefault(identity, asyncio.Lock())
+                )
+            tasks = []
+            for identity in body.task_ids:
+                task = await get_task(identity)
+                if not task.get("live") or not task.get("can_message"):
+                    raise HTTPException(
+                        409,
+                        "Finish the source tasks and reconnect to the worker before integration",
+                    )
+                if body.expected_versions.get(identity) != task["version"]:
+                    raise HTTPException(
+                        409,
+                        "A source task changed. Refresh the queue and review it again.",
+                    )
+                tasks.append(task)
+            result = await asyncio.to_thread(
+                integration_queue.enqueue,
+                project_id,
+                body.id,
+                tasks,
+                profile.model_dump(),
+                user_identity(team.actor()),
+            )
+            team.audit(
+                project_id,
+                "integration.queued",
+                task_id=body.id,
+                detail={"tasks": body.task_ids},
+            )
+            return result
+
+    @app.post("/api/projects/{project_id}/integration/{integration_id}/prepare")
+    async def prepare_integration(project_id: str, integration_id: str):
+        team.require(project_id, "maintainer")
+        async with (
+            project_workspace_locks.setdefault(project_id, asyncio.Lock()),
+            task_locks.setdefault(integration_id, asyncio.Lock()),
+        ):
+            return await asyncio.to_thread(
+                integration_queue.prepare, project_id, integration_id
+            )
+
+    @app.post("/api/projects/{project_id}/integration/{integration_id}/rebuild")
+    async def rebuild_integration(
+        project_id: str, integration_id: str, body: RebuildIntegration
+    ):
+        team.require(project_id, "maintainer")
+        async with (
+            project_workspace_locks.setdefault(project_id, asyncio.Lock()),
+            task_locks.setdefault(integration_id, asyncio.Lock()),
+        ):
+            item = integration_queue.find(
+                integration_queue.load(project_id), integration_id
+            )
+            if item.get("task_id"):
+                await require_idle(store.get("tasks", item["task_id"]))
+            result = await asyncio.to_thread(
+                integration_queue.rebuild,
+                project_id,
+                integration_id,
+                body.id,
+                user_identity(team.actor()),
+            )
+            team.audit(
+                project_id,
+                "integration.rebuilt",
+                task_id=body.id,
+                detail={"replaces": integration_id},
+            )
+            return result
+
+    @app.post("/api/projects/{project_id}/integration/{integration_id}/cancel")
+    async def cancel_integration(project_id: str, integration_id: str):
+        team.require(project_id, "maintainer")
+        async with (
+            project_workspace_locks.setdefault(project_id, asyncio.Lock()),
+            task_locks.setdefault(integration_id, asyncio.Lock()),
+        ):
+            item = integration_queue.find(
+                integration_queue.load(project_id), integration_id
+            )
+            if item.get("task_id"):
+                await require_idle(store.get("tasks", item["task_id"]))
+            result = await asyncio.to_thread(
+                integration_queue.cancel,
+                project_id,
+                integration_id,
+                user_identity(team.actor()),
+            )
+            team.audit(project_id, "integration.cancelled", task_id=integration_id)
+            return result
+
+    @app.post("/api/projects/{project_id}/integration/{integration_id}/publish")
+    async def publish_integration(
+        project_id: str, integration_id: str, body: IntegrationPublication
+    ):
+        team.require(project_id, "maintainer")
+        async with (
+            project_workspace_locks.setdefault(project_id, asyncio.Lock()),
+            task_locks.setdefault(integration_id, asyncio.Lock()),
+        ):
+            item = integration_queue.find(
+                integration_queue.load(project_id), integration_id
+            )
+            if item.get("task_id") != integration_id:
+                raise HTTPException(409, "Prepare and verify this integration first")
+            task = await get_task(integration_id)
+            require_available(task)
+            if (
+                not task.get("live")
+                or not task.get("can_message")
+                or task["version"] != body.expected_version
+            ):
+                raise HTTPException(
+                    409,
+                    "Integration changed or worker disconnected. Refresh and review before publication.",
+                )
+            event = team.audit(
+                project_id,
+                "integration.publish",
+                task_id=integration_id,
+                status="pending",
+                detail={"revision": body.revision},
+            )
+            try:
+                result = await asyncio.to_thread(
+                    integration_queue.publish,
+                    project_id,
+                    integration_id,
+                    task,
+                    body.revision,
+                    user_identity(team.actor()),
+                )
+            except Exception:
+                team.finish_audit(event, "unconfirmed")
+                raise
+            team.finish_audit(event, "completed")
+            return result
+
+    @app.get("/api/projects/{project_id}/integration/{integration_id}/ci")
+    async def integration_ci(project_id: str, integration_id: str):
+        from . import integration_github
+
+        team.require(project_id)
+        item = integration_queue.find(
+            integration_queue.load(project_id), integration_id
+        )
+        return await asyncio.to_thread(
+            integration_github.feedback, store.get("projects", project_id), item
+        )
 
     @app.get("/api/projects/{project_id}/sandbox")
     async def project_sandbox(project_id: str):
@@ -1479,6 +1754,11 @@ def create_app() -> FastAPI:
     async def delete_task(identity: str, body: DeleteTask = DeleteTask()):
         async with task_locks.setdefault(identity, asyncio.Lock()):
             task = store.get("tasks", identity)
+            if task.get("integration_id"):
+                raise HTTPException(
+                    409,
+                    "Cancel the integration in the project queue. Its review and publication receipts are retained.",
+                )
             if task.get("pending_message"):
                 raise HTTPException(
                     409,
@@ -1792,6 +2072,11 @@ def create_app() -> FastAPI:
         async with task_locks.setdefault(identity, asyncio.Lock()):
             task = await get_task(identity)
             team.require(task["project_id"], "maintainer")
+            if task.get("workspace_layout") == "project-worktree":
+                raise HTTPException(
+                    409,
+                    "Use the project integration queue to test and publish shared changes",
+                )
             require_available(task)
             if not task.get("live"):
                 raise HTTPException(

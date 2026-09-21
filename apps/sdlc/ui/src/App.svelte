@@ -49,6 +49,7 @@
   import ProjectMembers from "./ProjectMembers.svelte";
   import TeamActivity from "./TeamActivity.svelte";
   import SharedWorkspace from "./SharedWorkspace.svelte";
+  import IntegrationQueue from "./IntegrationQueue.svelte";
   import ExecutionWorkspace from "./ExecutionWorkspace.svelte";
   import ReviewPanel from "./ReviewPanel.svelte";
   import PreviewPanel from "./PreviewPanel.svelte";
@@ -75,6 +76,14 @@
     home?.profiles.filter((profile) => profile.provider !== "demo") ?? [],
   );
   let active = $state<Task | null>(null);
+  let integrationDialog = $state<{
+    show: (taskId?: string) => Promise<void>;
+  }>();
+  let integrationProject = $derived(
+    home?.projects.find(
+      (p) => p.id === (active?.project_id || selectedRepositoryId),
+    ),
+  );
   let view = $state("workspace");
   let tab = $state("activity");
   let composer = $state(false);
@@ -438,6 +447,10 @@
     deleteDialog?.showModal();
   }
   function confirmMerge() {
+    if (active?.workspace_layout === "project-worktree") {
+      void integrationDialog?.show(active.integration_id ? "" : active.id);
+      return;
+    }
     if (
       !active ||
       !active.live ||
@@ -1096,6 +1109,10 @@
           >
         </div>
         <div class="topbar-right">
+          {#if home?.shared && integrationProject}<button
+              onclick={() => integrationDialog?.show()}
+              ><GitMerge size={15} />Integration queue</button
+            >{/if}
           {#if home?.shared}<span class="account-name">{home.user?.name}</span
             ><button
               class="icon-button"
@@ -2465,6 +2482,19 @@
     </button>
   </div>
 </dialog>
+
+{#if home?.shared && integrationProject}
+  {#key integrationProject.id}
+    <IntegrationQueue
+      bind:this={integrationDialog}
+      project={integrationProject}
+      tasks={home.tasks}
+      profiles={configuredProfiles}
+      onselect={selectTask}
+      onrefresh={refresh}
+    />
+  {/key}
+{/if}
 
 <dialog
   class="delete-dialog merge-dialog"

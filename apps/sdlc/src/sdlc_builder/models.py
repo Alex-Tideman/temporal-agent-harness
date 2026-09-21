@@ -25,6 +25,7 @@ class TaskInput(BaseModel):
     profile: Profile
     continuation_context: str = Field(default="", max_length=8000)
     project_coordination: bool = False
+    integration_run: bool = False
 
 
 class FollowUpInput(BaseModel):
