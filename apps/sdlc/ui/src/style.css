@@ -2755,3 +2755,33 @@ select option {
   background: var(--control-bg);
   color: var(--text-1);
 }
+
+/* Shared workspace identity must leave room for pinned decisions on mobile. */
+.account-name {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.hidden-projects {
+  margin-top: 18px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.hidden-projects summary {
+  cursor: pointer;
+}
+.hidden-projects .repository-card {
+  margin-top: 10px;
+  justify-content: space-between;
+}
+@media (max-width: 760px) {
+  .account-name {
+    max-width: 70px;
+  }
+  .topbar-right .local-badge {
+    display: none;
+  }
+}

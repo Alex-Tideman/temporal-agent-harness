@@ -24,6 +24,7 @@ class TaskInput(BaseModel):
     mode: Literal["ask", "change"] = "change"
     profile: Profile
     continuation_context: str = Field(default="", max_length=8000)
+    project_coordination: bool = False
 
 
 class FollowUpInput(BaseModel):
@@ -164,6 +165,7 @@ class Control(BaseModel):
         "accept",
         "edit_started",
         "edit_finished",
+        "workspace_restored",
     ]
     gate_id: str = ""
     approved: bool = True

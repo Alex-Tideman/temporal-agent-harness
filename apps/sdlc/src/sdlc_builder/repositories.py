@@ -141,7 +141,7 @@ def browse(value: str = "") -> dict:
     }
 
 
-def discover(store: Store) -> dict:
+def discover(store: Store, projects: list[dict] | None = None) -> dict:
     saved = store.setting("projects_folder", "")
     result = {
         "folder": saved,
@@ -161,7 +161,7 @@ def discover(store: Store) -> dict:
         }
     connected = {
         item["path"]: item["id"]
-        for item in store.all("projects")
+        for item in (store.all("projects") if projects is None else projects)
         if not item.get("removed")
         if not item.get("demo")
     }

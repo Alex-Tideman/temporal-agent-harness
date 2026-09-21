@@ -12,15 +12,33 @@ from pathlib import Path
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Start boltzmann, your local development app")
+    parser = argparse.ArgumentParser(
+        description="Start boltzmann, your local development app"
+    )
     parser.add_argument("--data-dir", default="~/.local/share/sdlc-builder")
     parser.add_argument("--port", type=int, default=8787)
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address; shared access also requires --public-url",
+    )
+    parser.add_argument(
+        "--public-url",
+        help="Shared workspace HTTPS origin, e.g. https://workspace.example.com",
+    )
     parser.add_argument("--temporal-port", type=int, default=7333)
     parser.add_argument(
         "--external-temporal",
         help="Use an existing server (host:port), without starting or stopping it",
     )
     args = parser.parse_args()
+    if args.public_url:
+        os.environ["SDLC_PUBLIC_URL"] = args.public_url.rstrip("/")
+    from .collaboration import public_origin
+
+    origin = public_origin()
+    if args.host not in {"127.0.0.1", "localhost"} and not origin:
+        parser.error("Set --public-url when binding beyond localhost")
     root = Path(args.data_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.environ["SDLC_DATA_DIR"] = str(root)
@@ -91,7 +109,7 @@ def main():
                     1, f"Timed out starting Temporal. See {root / 'temporal.log'}\n"
                 )
         print(
-            f"\nboltzmann · Coding agent V2\nOpen http://127.0.0.1:{args.port}/#token={token_file.read_text().strip()}\n"
+            f"\nboltzmann · Coding agent V2\nOpen {origin or f'http://127.0.0.1:{args.port}'}/#token={token_file.read_text().strip()}\n"
             f"Data: {root}\n"
             f"Temporal: {os.environ['TEMPORAL_ADDRESS']} ({'external; keep it running' if args.external_temporal else 'started automatically'})\n"
             "Keep this terminal running. Ctrl-C stops the app; tasks resume on the next launch.\n",
@@ -103,7 +121,7 @@ def main():
 
         uvicorn.run(
             create_app(),
-            host="127.0.0.1",
+            host=args.host,
             port=args.port,
             log_level="warning",
             access_log=False,

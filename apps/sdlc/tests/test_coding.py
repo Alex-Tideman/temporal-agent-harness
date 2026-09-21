@@ -270,3 +270,35 @@ async def test_code_mode_limits_and_durable_resume():
     )
     assert fanout.done and "8 host calls" in fanout.error
     assert "20,000" in (await bounded_start(" " * 20001)).error
+
+
+async def test_workspace_restore_invalidates_acceptance_and_verification():
+    from sdlc_builder.coding_models import Evidence
+    from sdlc_builder.models import Control
+
+    obj = controller()
+    with obj.state.mutate() as state:
+        state.status = "accepted"
+        state.verification = "verified"
+        state.revision = "old-revision"
+        state.review_revision = "old-revision"
+        state.acceptance_note = "approved"
+        state.checks = [
+            Evidence(
+                id="check",
+                command="pytest",
+                exit_code=0,
+                output="passed",
+                revision="old-revision",
+            )
+        ]
+    assert (await obj.control(Control(command="workspace_restored")))["ok"]
+    assert obj.state.current.status == "review"
+    assert obj.state.current.verification == "stale"
+    assert obj.state.current.checks[0].stale
+    assert not obj.state.current.revision and not obj.state.current.review_revision
+    assert not obj.state.current.acceptance_note
+    obj.operation.assert_not_called()
+    with obj.state.mutate() as state:
+        state.status = "running"
+    assert not (await obj.control(Control(command="workspace_restored")))["ok"]

@@ -305,6 +305,7 @@ class SdlcAgentWorkflow:
         self.native_sdk = True
         task = TaskInput(
             task_id=self.current_task.task_id,
+            project_coordination=self.current_task.project_coordination,
             prompt=message.prompt,
             mode=message.mode,
             profile=message.profile,

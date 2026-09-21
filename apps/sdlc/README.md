@@ -1,6 +1,6 @@
 # boltzmann — execution workspace & interactive review
 
-A local development app around **the published Temporal Agent Harness package**. Open a Git repository, investigate it or request a small change, approve a plan, watch the agent work, approve checks, inspect the patch, and accept or continue.
+A development app for local use or a shared team server around **the published Temporal Agent Harness package**. Open a Git repository, investigate it or request a small change, approve a plan, watch the agent work, approve checks, inspect the patch, and accept or continue.
 
 New workspaces run in **E2B sandboxes by default**. Existing local tasks keep their original workspace. See the sandbox setup below and [performance notes](PERFORMANCE.md) for the measured improvements and remaining latency costs.
 
@@ -10,7 +10,9 @@ New tasks use **Coding agent V2**: native OpenAI tools, bounded harness Code Mod
 
 ## Start
 
-Requires Python 3.11+, `uv`, Node, `pnpm` (tested/pinned at 8.10.5), Git, and the Temporal CLI (`brew install temporal` on macOS). The initial target is macOS/Linux, one developer, one local app instance per data directory.
+For team access, see [shared workspace setup, roles, and coordinated worktrees](COLLABORATION.md). New shared-mode tasks reuse one E2B sandbox per project, with separate task branches, owners, previews, and recoverable code checkpoints. Local startup below remains unchanged.
+
+Requires Python 3.11+, `uv`, Node, `pnpm` (tested/pinned at 8.10.5), Git, and the Temporal CLI (`brew install temporal` on macOS). The target is macOS/Linux, one app instance per data directory. Shared mode supports multiple browser users on that server; see [multi-developer setup](COLLABORATION.md).
 
 From the repository root:
 
@@ -22,7 +24,7 @@ Open the **launch URL printed in the terminal**. It unlocks the local applicatio
 
 **Temporal must be running for tasks to execute. You do not need to start it separately:** this launcher starts the persistent local Temporal server, the worker, and the web app together. Install the Temporal CLI first; no Docker, Temporal Cloud account, or separate harness server is needed for this local setup. Closing the browser is fine; stopping the launcher pauses execution until you launch it again. Ensure ports `8787` and `7333` are available (or use the port options below).
 
-For a real task you also need a locally cloned Git repository with at least one commit, and an API key with access to the exact API model ID you enter. Save the model key through **Settings** in your unlocked OS keyring, or export the configured environment variable **before launching** the app. The demo needs no model provider key, but uses E2B like other new workspaces. Checks may require project-specific runtimes/dependencies in the sandbox.
+For a real task you also need a Git repository with at least one commit (a local checkout or a GitHub URL), and an API key with access to the exact API model ID you enter. Save the model key through **Settings** in your unlocked OS keyring, or export the configured environment variable **before launching** the app. The demo needs no model provider key, but uses E2B like other new workspaces. Checks may require project-specific runtimes/dependencies in the sandbox.
 
 ### E2B workspace setup
 
@@ -37,7 +39,7 @@ Settings shows whether the key is present. New task creation fails with a setup 
 
 **Sandbox environments are selected automatically.** Before creating a task, the app inspects committed manifests, including nested packages, to choose a Node.js, Python, or combined runtime template. It detects npm/pnpm/Yarn/Bun from `packageManager` and lockfiles, exact Node versions from `.nvmrc`, `.node-version`, or Volta, and Python versions from `.python-version`. Common simple `engines.node` and `requires-python` declarations are also recognized. Defaults are Node.js 24 and Python 3.12 when a detected runtime has no recognized version declaration; complex ranges, conflicting monorepo versions, and runtimes other than Node/Python still require verification by the task's setup/check commands. Python template selection supports 3.11 and newer.
 
-Matching runtime templates are built on demand through the [E2B template API](https://docs.e2b.dev/template/quickstart) and reused across repositories and app restarts. Builds install the runtime, package managers, Git, and Python needed by the harness, and verify that the tools run. They do **not** copy repository files or install repository dependencies into shared templates. Dependencies remain in the individual task's sandbox. First-time builds can add up to approximately 90 seconds to preparation; if a build fails or is still pending, the task uses E2B's general-purpose `base` environment, and a later task can reuse the completed build. Build requests and SDK calls have bounded waits, failures have a retry cooldown, and parallel requests share a local build lock. The UI shows preparation feedback and records the selected environment and fallback reason under **Session, plan & workspace details**.
+Matching runtime templates are built on demand through the [E2B template API](https://docs.e2b.dev/template/quickstart) and reused across repositories and app restarts. Builds install the runtime, package managers, Git, and Python needed by the harness, and verify that the tools run. They do **not** copy repository files or install repository dependencies into shared templates. Dependencies remain in the individual task's workspace. Shared-mode tasks have separate worktrees in the project's sandbox. First-time builds can add up to approximately 90 seconds to preparation; if a build fails or is still pending, the task uses E2B's general-purpose `base` environment, and a later task can reuse the completed build. Build requests and SDK calls have bounded waits, failures have a retry cooldown, and parallel requests share a local build lock. The UI shows preparation feedback and records the selected environment and fallback reason under **Session, plan & workspace details**.
 
 No template selection or repository configuration is required. An optional custom `E2B_TEMPLATE` name/ID in the launch environment remains an operator override; unset it or use `auto` (also the legacy `base` value) for automatic selection. Existing sandboxes retain their environment, and forks inherit their parent's selected template. Build receipts live in `sandbox-templates/` under the app data directory, separated by E2B credential and endpoint. App-managed templates remain in E2B for reuse when tasks are deleted and can be removed through E2B; normal E2B build and sandbox charges apply.
 
@@ -45,7 +47,7 @@ The app uploads a bounded snapshot of committed HEAD, excluding secret/generated
 
 The sandbox ID is saved under the app data directory in `sandboxes/<task-id>.json`. An app restart reconnects to that ID. Sandboxes auto-pause after their five-minute running timeout and resume on access, preserving files and installed dependencies. If a sandbox is lost or unreachable, the app reports the problem rather than creating an empty replacement or executing on the host. Keep the app data directory as well as the E2B sandbox to continue a task.
 
-Deleting a task while keeping its workspace pauses the sandbox and retains its descriptor; you can manage the retained sandbox through E2B. Selecting **Also permanently delete this task's isolated workspace** kills the E2B sandbox. Cleanup errors keep the task listed for retry. E2B's service charges apply. Repository size is limited to 50,000 regular files / 256 MB, and existing text/patch/command limits still apply.
+**Local mode and existing per-task sandboxes:** deleting a task while keeping its workspace pauses its sandbox and retains the descriptor. Selecting **Also permanently delete this task's isolated workspace** kills that task's E2B sandbox. **New shared-mode worktrees:** deletion stops only the task's preview and optionally removes its worktree/branch and checkpoints. The project sandbox stays available to other tasks and can pause when idle. Use **Coordinate → Sandbox → Recover sandbox** for explicit project-wide replacement from saved code checkpoints. Cleanup errors keep the task listed for retry. E2B's service charges apply. Repository size is limited to 50,000 regular files / 256 MB, and existing text/patch/command limits still apply.
 
 For an explicit local-only development or offline demo session, launch with `SDLC_WORKSPACE_BACKEND=local ./apps/sdlc/dev`. That option allows new host workspaces; the UI labels them as local, and approved commands can access host files. Changing the default does not relocate existing tasks or turn E2B workspaces into local ones.
 
@@ -154,6 +156,7 @@ boltzmann checks the current execution before deleting. If Temporal cannot be re
 - E2B workspaces seeded from committed HEAD, with a separate Git baseline, saved sandbox IDs, pause/resume, path/secret/generated-file exclusions, no symlink traversal, text-file limits, stale-hash rejection, atomic writes, and host-side operation journals. Existing local clones retain their backend. The source checkout's uncommitted/untracked files are not copied; the UI reports when the source was dirty.
 - Automatic E2B web preview setup and HTTP smoke checks, missing package-manager installation, agent repair feedback, an embedded browser, public preview links, advanced overrides, bounded logs, and process cleanup.
 - File inspection/manual editing, actual command exit codes/output, tracked and new text-file diffs, patch export, workflow-owned guarded merge into the configured source checkout, task history/search, draft persistence, keyboard shortcuts (`⌘/Ctrl K`, `⌘/Ctrl ,`), and opt-in desktop notifications. Merge activities use operation journals and per-project OS locks; completed receipts remain in observable Temporal state across app restarts.
+- Optional shared accounts, project roles and invitations, per-person repository visibility/review checkpoints, attributed comments/decisions, and managed GitHub checkouts. See [stage 1 and the remaining stages](COLLABORATION.md).
 - GitHub remote links for existing checkouts; immutable per-message provider configuration; credential references rather than secret values in workflow history and SQLite; same-origin local authentication and request checks.
 
 ## Deliberate limits of this milestone
@@ -166,7 +169,7 @@ boltzmann includes a small serialization compatibility layer for harness 0.4.0: 
 
 The published package also needs a stream-observer adapter for function-call completion events that omit `name`. The harness source now takes the tool name from the opening item, and boltzmann adapts the observer's event copy for the published package. Without this fix, the provider can respond successfully but the task fails with `ResponseFunctionCallArgumentsDoneEvent ... has no attribute 'name'`. A passing connection test checks credentials, native tool calling, and structured output; it does not exercise the Temporal activity's harness observer. No key or profile change is needed for this error: restart the app and continue the affected task.
 
-It is best suited to questions and focused text-file changes. It has no semantic index, language server, interactive terminal, delete/rename tool, automatic browser interaction testing, branch publishing, PR/CI integration, deployment adapter, automatic rollback, or shared-service authentication yet. Those are planned after your feedback. Deployment configuration is documented in the plan, not presented as a working control.
+It is best suited to questions and focused text-file changes. It has no semantic index, language server, interactive terminal, delete/rename tool, automatic browser interaction testing, branch publishing, PR/CI integration, deployment adapter, automatic rollback, or a shared-worktree merge queue yet. Those are planned after your feedback. Deployment configuration is documented in the plan, not presented as a working control.
 
 V2 stage status records controller progress; requirements still need your review. Check and review receipts identify the source revision. App edits invalidate evidence immediately; revision reads before/after checks and review, and again on acceptance, detect external edits. External edits are not continuously watched. Incomplete verification requires an explicit acceptance note. V1 retains its original progress semantics. Browser drafts are local to that browser; task state and evidence live in Temporal/SQLite.
 

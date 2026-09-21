@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import workspace_runtime as runtime
 from .sandbox import remote_capable
-from .store import data_dir, workspace
+from .store import Store, data_dir, workspace
 from .workspace_runtime import MAX_FILE as MAX_FILE
 from .workspace_runtime import allowed as allowed
 from .workspace_runtime import git_apply, safe_path
@@ -40,6 +40,11 @@ def prepare_workspace(source: str, task_id: str) -> dict:
     from .sandbox import configuration, prepare
 
     if configuration()["backend"] == "e2b":
+        task = next((t for t in Store().all("tasks") if t["id"] == task_id), {})
+        if task.get("workspace_layout") == "project-worktree":
+            from . import project_workspaces
+
+            return project_workspaces.prepare(task["project_id"], source, task_id)
         return prepare(source, task_id)
     root = workspace(task_id)
     source_path = Path(source).expanduser().resolve()
@@ -181,6 +186,14 @@ def continue_workspace(parent_id: str, task_id: str) -> dict:
 
     parent = workspace(parent_id)
     if configuration()["backend"] == "e2b" or is_remote(parent):
+        task = next((t for t in Store().all("tasks") if t["id"] == task_id), {})
+        if task.get("workspace_layout") == "project-worktree":
+            from . import project_workspaces
+
+            project = Store().get("projects", task["project_id"])
+            return project_workspaces.prepare(
+                task["project_id"], project["path"], task_id, parent_id
+            )
         return prepare("", task_id, parent_id=parent_id)
     patch = diff(parent)
     if patch["truncated"]:

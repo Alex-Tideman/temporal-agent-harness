@@ -22,6 +22,7 @@
     onfile,
     onreview,
     ontrace,
+    debugAvailable = true,
     onchecks,
   }: {
     progress: State;
@@ -31,6 +32,7 @@
     onfile: (path: string) => void;
     onreview: () => void;
     ontrace: (identity?: string) => void;
+    debugAvailable?: boolean;
     onchecks: () => void;
   } = $props();
   let following = $state(true);
@@ -176,12 +178,12 @@
           onclick={() => (inspector = "remaining")}
           >Remaining <span>{remaining.length}</span></button
         >
-        <button
-          class="trace-link"
-          title="Open the session trace for all agents"
-          onclick={() => ontrace()}
-          ><Activity size={13} />Trace <ArrowUpRight size={12} /></button
-        >
+        {#if debugAvailable}<button
+            class="trace-link"
+            title="Open the session trace for all agents"
+            onclick={() => ontrace()}
+            ><Activity size={13} />Trace <ArrowUpRight size={12} /></button
+          >{/if}
       </div>
       <div class="inspector-body">
         {#if inspector === "remaining"}

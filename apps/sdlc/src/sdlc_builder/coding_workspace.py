@@ -9,11 +9,12 @@ import os
 import re
 import subprocess
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 from temporalio import activity
 
-from . import previews
+from . import coordination, previews, project_workspaces
 from . import workspaces as ws
 from .coding_models import (
     FileChange,
@@ -169,6 +170,21 @@ async def project_merge_operation(
 async def coding_operation(
     task_id: str, operation_id: str, call: ToolCall
 ) -> ToolResult:
+    guard = (
+        project_workspaces.writer_lease(task_id, "agent:" + operation_id)
+        if project_workspaces.shared(workspace(task_id))
+        else nullcontext()
+    )
+    try:
+        with guard:
+            return await _coding_operation(task_id, operation_id, call)
+    except ValueError as error:
+        return ToolResult(ok=False, operation_id=operation_id, error=str(error))
+
+
+async def _coding_operation(
+    task_id: str, operation_id: str, call: ToolCall
+) -> ToolResult:
     started = time.monotonic()
     root = workspace(task_id)
     if not operation_id.replace("-", "").isalnum():
@@ -202,6 +218,25 @@ async def coding_operation(
     try:
         if call.kind == "list":
             result.files = await asyncio.to_thread(ws.files, root)
+            if project_workspaces.shared(root):
+                result.output = json.dumps(
+                    await asyncio.to_thread(coordination.board, task_id)
+                )
+        elif call.kind == "coordinate":
+            if not project_workspaces.shared(root):
+                raise ValueError("Coordination requires a shared project worktree")
+            if call.query:
+                await asyncio.to_thread(
+                    coordination.post,
+                    task_id,
+                    call.path,
+                    call.query,
+                    task_id + ":" + operation_id,
+                    {"id": task_id, "name": "Task agent", "kind": "agent"},
+                )
+            result.output = json.dumps(
+                await asyncio.to_thread(coordination.board, task_id)
+            )
         elif call.kind == "read":
             result.file = FileView.model_validate(
                 await asyncio.to_thread(ws.read_file, root, call.path)
@@ -287,6 +322,13 @@ async def coding_operation(
             preview["logs"] = preview.get("logs", "")[-8000:]
             result.output = json.dumps(preview)
             result.revision = await asyncio.to_thread(revision, root)
+            if project_workspaces.shared(root):
+                await asyncio.to_thread(project_workspaces.checkpoint, root)
+                await asyncio.to_thread(
+                    previews.mark_checkpointed,
+                    root,
+                    previews.saved(root).get("run_id", ""),
+                )
         elif call.kind == "check":
             if is_remote(root):
                 checked = await asyncio.to_thread(

@@ -101,14 +101,15 @@ def _client(meta: dict):
         return _clients[identity]
 
 
-def _rpc(client, operation: str, args: list):
+def _rpc(client, operation: str, args: list, *, remote_root=REMOTE_ROOT, shared=False):
     script, _ = _runtime_path()
     request_path = f"{CONTROL_ROOT}/{uuid.uuid4().hex}.json"
     client.files.write(
         request_path,
         json.dumps(
             {
-                "root": REMOTE_ROOT,
+                "root": remote_root,
+                "shared": shared,
                 "operation": operation,
                 "args": args,
             }
@@ -143,6 +144,10 @@ def call(root: Path, operation: str, *args):
         for arg in args
     ]
     try:
+        if meta.get("project_id"):
+            from . import project_workspaces
+
+            return project_workspaces.call(root, operation, args)
         return _rpc(_client(meta), operation, args)
     except ValueError:
         raise
@@ -338,6 +343,15 @@ def retry_preparation(task: dict) -> dict:
     """Resume an undispatched task in its saved sandbox, preserving its snapshot."""
     started = time.monotonic()
     root = workspace(task["id"])
+    from . import project_workspaces
+
+    if project_workspaces.shared(root):
+        from .store import Store
+
+        project = Store().get("projects", task["project_id"])
+        return project_workspaces.prepare(
+            project["id"], project["path"], task["id"], task.get("parent_task_id", "")
+        )
     meta = json.loads(descriptor(root).read_text())
     if meta.get("status") != "ready":
         if (
@@ -370,6 +384,10 @@ def release(root: Path, *, remove: bool):
     if not is_remote(root):
         return
     meta = json.loads(descriptor(root).read_text())
+    if meta.get("project_id"):
+        from . import project_workspaces
+
+        return project_workspaces.release(root, remove)
     try:
         sdk = _sdk()
         if remove:

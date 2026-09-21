@@ -133,6 +133,7 @@ class ToolCall(BaseModel):
         "edit",
         "check",
         "preview",
+        "coordinate",
         "model",
         "usage",
     ]
@@ -196,6 +197,7 @@ class Assignment(BaseModel):
     profile: Profile
     prompt: str
     max_calls: int
+    project_coordination: bool = False
 
 
 class RoleReply(BaseModel):

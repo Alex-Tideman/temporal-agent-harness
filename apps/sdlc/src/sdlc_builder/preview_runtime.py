@@ -257,16 +257,20 @@ def supervise(config: Path):
                     "This port is already in use. Choose another preview port."
                 )
         # Do not inherit credentials from a template or the SDK control channel.
+        home = Path(settings.get("home") or root.parent)
+        (home / ".tmp").mkdir(parents=True, exist_ok=True)
         environment = {
             "PATH": os.pathsep.join(
                 [
                     str(config.parent / "tools/bin"),
-                    str(root.parent / ".bun/bin"),
-                    str(root.parent / ".local/share/pnpm"),
+                    str(home / ".bun/bin"),
+                    str(home / ".local/share/pnpm"),
                     os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
                 ]
             ),
-            "HOME": str(root.parent),
+            "HOME": str(home),
+            "TMPDIR": str(home / ".tmp"),
+            "XDG_CACHE_HOME": str(home / ".cache"),
             "LANG": "C.UTF-8",
             "PORT": str(settings["port"]),
             "HOST": "0.0.0.0",
@@ -279,6 +283,18 @@ def supervise(config: Path):
             "COREPACK_ENABLE_AUTO_PIN": "0",
             "YARN_ENABLE_IMMUTABLE_INSTALLS": "false",
         }
+        source_lock = None
+        if settings.get("shared"):
+            lock_dir = root.parent / ".locks"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            source_lock = (lock_dir / (root.name + ".lock")).open("a")
+            try:
+                fcntl.flock(source_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                source_lock.close()
+                raise ValueError(
+                    "This worktree has an in-flight operation. Retry preview setup when it finishes."
+                ) from None
         argv = (
             [sys.executable, "-I", __file__, "setup", str(config)]
             if settings.get("setup")
@@ -317,6 +333,9 @@ def supervise(config: Path):
                 if not was_ready and time.monotonic() >= next_probe:
                     http_status = probe(settings)
                     was_ready = http_status is not None and 200 <= http_status < 400
+                    if was_ready and source_lock is not None:
+                        source_lock.close()
+                        source_lock = None
                     next_probe = time.monotonic() + 3
                 if not was_ready and time.monotonic() - started > settings.get(
                     "startup_timeout", 540
@@ -346,6 +365,8 @@ def supervise(config: Path):
                     except subprocess.TimeoutExpired:
                         pass
             child.wait()
+            if source_lock is not None:
+                source_lock.close()
             child.stdout.close()
             selector.close()
             save(state_path, {**state, "exit_code": child.returncode})

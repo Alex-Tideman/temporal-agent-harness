@@ -22,9 +22,11 @@
 
   let {
     projects,
+    shared = false,
     onconnect,
   }: {
     projects: Project[];
+    shared?: boolean;
     onconnect: (project: Project) => Promise<boolean>;
   } = $props();
   let dialog = $state<HTMLDialogElement>();
@@ -32,6 +34,7 @@
   let search = $state<HTMLInputElement>();
   let query = $state("");
   let path = $state("");
+  let remoteUrl = $state("");
   let error = $state("");
   let busy = $state("");
   let loading = $state(false);
@@ -67,7 +70,7 @@
     dialog?.showModal();
     await tick();
     search?.focus();
-    await loadSuggestions();
+    if (!shared) await loadSuggestions();
   }
   async function loadSuggestions() {
     const request = ++generation;
@@ -89,6 +92,24 @@
       const project =
         existing ?? (await api<Project>("/projects", "POST", { path: value }));
       if (await onconnect(project)) dialog?.close();
+    } catch (e) {
+      error = (e as Error).message;
+    } finally {
+      busy = "";
+    }
+  }
+  async function connectRemote() {
+    if (busy) return;
+    busy = "Connecting GitHub repository…";
+    error = "";
+    try {
+      const project = await api<Project>("/projects/remote", "POST", {
+        url: remoteUrl,
+      });
+      if (await onconnect(project)) {
+        remoteUrl = "";
+        dialog?.close();
+      }
     } catch (e) {
       error = (e as Error).message;
     } finally {
@@ -263,20 +284,46 @@
       </footer>
     </div>
   {:else}
-    <div class="repository-dialog-actions">
-      <button
-        type="button"
-        class="primary"
-        disabled={!!busy}
-        onclick={() => pick("repository")}
-        ><FolderOpen size={16} />Choose folder<ArrowRight size={15} /></button
-      ><span>From this computer</span>
-    </div>
+    {#if !shared}
+      <div class="repository-dialog-actions">
+        <button
+          type="button"
+          class="primary"
+          disabled={!!busy}
+          onclick={() => pick("repository")}
+          ><FolderOpen size={16} />Choose folder<ArrowRight size={15} /></button
+        ><span>From this computer</span>
+      </div>{/if}
+    <form
+      class="remote-repository"
+      onsubmit={(event) => {
+        event.preventDefault();
+        void connectRemote();
+      }}
+    >
+      <label for="github-url">GitHub repository</label>
+      <div>
+        <input
+          id="github-url"
+          type="url"
+          bind:value={remoteUrl}
+          placeholder="https://github.com/owner/repository"
+          required
+          disabled={!!busy}
+        /><button class="primary" disabled={!!busy || !remoteUrl.trim()}
+          >Connect<ArrowRight size={14} /></button
+        >
+      </div>
+      <p>
+        Connect a repository your server can access. Private repositories need
+        GitHub access configured by your administrator.
+      </p>
+    </form>
     <div class="repository-search dialog-search">
       <Search size={16} /><input
         bind:this={search}
         bind:value={query}
-        aria-label="Search local repositories"
+        aria-label="Search repositories"
         placeholder="Find a repository…"
         autocomplete="off"
       />
@@ -299,99 +346,130 @@
               ><Check size={14} /><ArrowRight size={15} /></button
             >{/each}
         </section>{/if}
-      <section aria-label="Suggested repositories">
-        <div class="repository-section-heading">
-          <span>Suggested repositories</span>{#if discovery?.folder}<button
-              type="button"
-              class="icon-button"
-              aria-label="Refresh suggested repositories"
-              disabled={!!busy || loading}
-              onclick={loadSuggestions}><RefreshCw size={13} /></button
-            >{/if}
-        </div>
-        {#if discovery?.folder}<div class="projects-folder">
-            <span title={discovery.folder}>{discovery.display_path}</span
-            ><button
-              type="button"
-              disabled={!!busy}
-              onclick={() => pick("projects")}>Change</button
-            ><button
-              type="button"
-              class="icon-button"
-              aria-label="Forget projects folder"
-              disabled={!!busy}
-              onclick={forgetFolder}><X size={13} /></button
-            >
-          </div>{/if}
-        {#if loading}<p class="repository-empty">Finding repositories…</p>
-        {:else if discovery?.folder}
-          {#each suggestions as item}<button
-              type="button"
-              class="repository-option"
-              disabled={!!busy}
-              onclick={() => connect(item.path)}
-              aria-label={`Add ${item.name} — ${item.display_path}`}
-              ><FolderOpen size={17} /><span
-                ><strong>{item.name}</strong><small title={item.path}
-                  >{item.display_path}</small
-                ></span
-              ><ArrowRight size={15} /></button
-            >{:else}<p class="repository-empty">
-              {discovery.warning ||
-                (query
-                  ? "No matching repositories in this folder."
-                  : "No new repositories found. Choose a repository folder directly, or change your projects folder.")}
-            </p>{/each}
-          {#if discovery.truncated}<p class="repository-empty">
-              Showing a limited scan. Choose a more specific projects folder to
-              find more.
-            </p>{/if}
-        {:else}<div class="repository-discovery-empty">
-            <FolderPlus size={20} />
-            <p>
-              Keep your projects together?<span
-                >Choose their parent folder once to see suggestions here.</span
+      {#if !shared}<section aria-label="Suggested repositories">
+          <div class="repository-section-heading">
+            <span>Suggested repositories</span>{#if discovery?.folder}<button
+                type="button"
+                class="icon-button"
+                aria-label="Refresh suggested repositories"
+                disabled={!!busy || loading}
+                onclick={loadSuggestions}><RefreshCw size={13} /></button
+              >{/if}
+          </div>
+          {#if discovery?.folder}<div class="projects-folder">
+              <span title={discovery.folder}>{discovery.display_path}</span
+              ><button
+                type="button"
+                disabled={!!busy}
+                onclick={() => pick("projects")}>Change</button
+              ><button
+                type="button"
+                class="icon-button"
+                aria-label="Forget projects folder"
+                disabled={!!busy}
+                onclick={forgetFolder}><X size={13} /></button
               >
-            </p>
-            <button
-              type="button"
-              disabled={!!busy}
-              onclick={() => pick("projects")}>Choose projects folder</button
-            >
-          </div>{/if}
-      </section>
+            </div>{/if}
+          {#if loading}<p class="repository-empty">Finding repositories…</p>
+          {:else if discovery?.folder}
+            {#each suggestions as item}<button
+                type="button"
+                class="repository-option"
+                disabled={!!busy}
+                onclick={() => connect(item.path)}
+                aria-label={`Add ${item.name} — ${item.display_path}`}
+                ><FolderOpen size={17} /><span
+                  ><strong>{item.name}</strong><small title={item.path}
+                    >{item.display_path}</small
+                  ></span
+                ><ArrowRight size={15} /></button
+              >{:else}<p class="repository-empty">
+                {discovery.warning ||
+                  (query
+                    ? "No matching repositories in this folder."
+                    : "No new repositories found. Choose a repository folder directly, or change your projects folder.")}
+              </p>{/each}
+            {#if discovery.truncated}<p class="repository-empty">
+                Showing a limited scan. Choose a more specific projects folder
+                to find more.
+              </p>{/if}
+          {:else}<div class="repository-discovery-empty">
+              <FolderPlus size={20} />
+              <p>
+                Keep your projects together?<span
+                  >Choose their parent folder once to see suggestions here.</span
+                >
+              </p>
+              <button
+                type="button"
+                disabled={!!busy}
+                onclick={() => pick("projects")}>Choose projects folder</button
+              >
+            </div>{/if}
+        </section>
+      {/if}
       {#if query && !connected.length && !suggestions.length && !loading}<p
           class="repository-empty"
         >
-          Can't find it? Choose its folder above.
+          Connect another repository above.
         </p>{/if}
     </div>
   {/if}
-  <details class="repository-manual" bind:this={manual}>
-    <summary>Enter path</summary>
-    <form
-      onsubmit={(event) => {
-        event.preventDefault();
-        if (listing) useFolder(path);
-        else connect(path);
-      }}
-    >
-      <label for="repository-path"
-        >{listing && folderPurpose === "projects"
-          ? "Projects folder"
-          : "Repository folder"}</label
+  {#if !shared}<details class="repository-manual" bind:this={manual}>
+      <summary>Enter path</summary>
+      <form
+        onsubmit={(event) => {
+          event.preventDefault();
+          if (listing) useFolder(path);
+          else connect(path);
+        }}
       >
-      <div>
-        <input
-          id="repository-path"
-          bind:value={path}
-          placeholder="~/Projects/my-project"
-          required
-          disabled={!!busy}
-        /><button type="submit" disabled={!!busy || !path.trim()}
-          >Open<ArrowRight size={14} /></button
+        <label for="repository-path"
+          >{listing && folderPurpose === "projects"
+            ? "Projects folder"
+            : "Repository folder"}</label
         >
-      </div>
-    </form>
-  </details>
+        <div>
+          <input
+            id="repository-path"
+            bind:value={path}
+            placeholder="~/Projects/my-project"
+            required
+            disabled={!!busy}
+          /><button type="submit" disabled={!!busy || !path.trim()}
+            >Open<ArrowRight size={14} /></button
+          >
+        </div>
+      </form>
+    </details>{/if}
 </dialog>
+
+<style>
+  .remote-repository {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  .remote-repository label {
+    display: block;
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+  .remote-repository div {
+    display: flex;
+    gap: 8px;
+  }
+  .remote-repository input {
+    flex: 1;
+    min-width: 0;
+  }
+  .remote-repository p {
+    font-size: 11px;
+    color: var(--text-3);
+    margin: 8px 0 0;
+  }
+  @media (max-width: 520px) {
+    .remote-repository div {
+      flex-direction: column;
+    }
+  }
+</style>

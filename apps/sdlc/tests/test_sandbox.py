@@ -8,6 +8,7 @@ import hashlib
 import json
 import shlex
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -31,8 +32,15 @@ def remote(tmp_path, monkeypatch):
         def __init__(self, identity):
             self.sandbox_id = identity
             self.root = tmp_path / identity
-            self.files = SimpleNamespace(write=self.write)
+            self.files = SimpleNamespace(write=self.write, read=self.read)
             self.commands = SimpleNamespace(run=self.run)
+
+        def set_timeout(self, timeout):
+            assert timeout == sandbox.IDLE_TIMEOUT
+
+        def connect(self, *, timeout):
+            assert timeout == sandbox.IDLE_TIMEOUT
+            return self
 
         def translate(self, path):
             return self.root / path.lstrip("/")
@@ -42,14 +50,33 @@ def remote(tmp_path, monkeypatch):
             target.parent.mkdir(parents=True, exist_ok=True)
             if path.endswith(".json"):
                 payload = json.loads(data)
-                assert payload["root"] == sandbox.REMOTE_ROOT
-                payload["root"] = str(self.translate(payload["root"]))
-                if payload["operation"] == "initialize":
-                    payload["args"][0] = str(self.translate(payload["args"][0]))
-                data = json.dumps(payload)
+                if "operation" in payload:
+                    assert payload["root"].startswith("/home/user/")
+                    payload["root"] = str(self.translate(payload["root"]))
+                    if payload["operation"] in {"initialize", "project_prepare"}:
+                        payload["args"][0] = str(self.translate(payload["args"][0]))
+                    elif payload["operation"] == "project_restore":
+                        for field in ("archive", "bundle"):
+                            payload["args"][0][field] = str(
+                                self.translate(payload["args"][0][field])
+                            )
+                    data = json.dumps(payload)
             target.write_bytes(data if isinstance(data, bytes) else data.encode())
 
+        def read(self, path, **kwargs):
+            target = (
+                Path(path)
+                if str(path).startswith(str(self.root))
+                else self.translate(path)
+            )
+            assert target.resolve().is_relative_to(self.root.resolve())
+            return target.read_bytes()
+
         def run(self, command, **kwargs):
+            if self.sandbox_id in killed:
+                from e2b import NotFoundException
+
+                raise NotFoundException("Sandbox was killed")
             args = shlex.split(command)
             if args[0] == "mkdir":
                 self.translate(args[-1]).mkdir(parents=True, exist_ok=True)
@@ -76,6 +103,10 @@ def remote(tmp_path, monkeypatch):
 
         @staticmethod
         def connect(identity, **kwargs):
+            if identity in killed:
+                from e2b import NotFoundException
+
+                raise NotFoundException("Sandbox was killed")
             connected.append(identity)
             return clients[identity]
 

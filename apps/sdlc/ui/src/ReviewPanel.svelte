@@ -21,12 +21,16 @@
 
   let {
     taskId,
+    canReview = true,
+    storagePrefix = "sdlc.",
     visible,
     initialPath = "",
     requestKey = 0,
     onrequest,
   }: {
     taskId: string;
+    canReview?: boolean;
+    storagePrefix?: string;
     visible: boolean;
     initialPath?: string;
     requestKey?: number;
@@ -84,10 +88,10 @@
       try {
         if (draft)
           localStorage.setItem(
-            "sdlc.review-draft." + taskId,
+            storagePrefix + "review-draft." + taskId,
             JSON.stringify(draft),
           );
-        else localStorage.removeItem("sdlc.review-draft." + taskId);
+        else localStorage.removeItem(storagePrefix + "review-draft." + taskId);
       } catch {
         /* The draft remains available in memory. */
       }
@@ -157,6 +161,7 @@
     }
   }
   function startComment(side = "file", line = 0) {
+    if (!canReview) return;
     if (!file || file.issue || outdated) return;
     if (
       draft?.text.trim() &&
@@ -228,7 +233,8 @@
   onMount(() => {
     try {
       draft = JSON.parse(
-        localStorage.getItem("sdlc.review-draft." + taskId) ?? "null",
+        localStorage.getItem(storagePrefix + "review-draft." + taskId) ??
+          "null",
       );
     } catch {
       draft = null;
@@ -355,13 +361,26 @@
             </div>
             <button
               class:marked={current?.reviewed}
-              disabled={busy || outdated || !!file.issue || file.truncated}
+              disabled={!canReview ||
+                busy ||
+                outdated ||
+                !!file.issue ||
+                file.truncated}
               onclick={markReviewed}
+              title={current?.reviewed_by?.length
+                ? "Reviewed by " +
+                  current.reviewed_by.map((person) => person.name).join(", ")
+                : "Your review progress"}
               >{#if current?.reviewed}<CheckCheck
                   size={14}
                 />Reviewed{:else}<Circle size={14} />Mark reviewed{/if}</button
             >
           </div>
+          {#if current?.reviewed_by?.length}<p class="diff-meta">
+              Reviewed at this version by {current.reviewed_by
+                .map((person) => person.name)
+                .join(", ")}
+            </p>{/if}
           {#if outdated}<div class="review-message changed" role="status">
               This file changed. Your diff stays at the version you opened.<button
                 disabled={busy}
@@ -370,8 +389,12 @@
             </div>{/if}
           {#if file.issue}<p class="review-message">{file.issue}</p>{:else}
             <div class="diff-instruction">
-              <span>Click a line to leave a comment.</span><button
-                disabled={outdated || busy}
+              <span
+                >{canReview
+                  ? "Click a line to leave a comment."
+                  : "Read-only review. Ask a project owner for developer access to leave comments."}</span
+              ><button
+                disabled={!canReview || outdated || busy}
                 onclick={() => startComment()}
                 ><Plus size={12} />File comment</button
               >
@@ -386,7 +409,7 @@
                   </div>
                 {:else}<button
                     class="diff-line {line.kind}"
-                    disabled={outdated || busy}
+                    disabled={!canReview || outdated || busy}
                     aria-label={`Comment on ${line.new ? "new" : "old"} line ${line.new || line.old}`}
                     onclick={() =>
                       startComment(
@@ -483,7 +506,8 @@
             <small>Saved comments do not start the agent.</small><button
               type="submit"
               class="primary"
-              disabled={busy || !draft.text.trim()}>Save comment</button
+              disabled={!canReview || busy || !draft.text.trim()}
+              >Save comment</button
             >
           </div>
         </form>{/if}
@@ -509,17 +533,20 @@
                       : ""}</small
                   ></span
                 ></label
-              ><button disabled={busy} onclick={() => resolve(comment)}
+              ><button
+                disabled={!canReview || busy}
+                onclick={() => resolve(comment)}
                 >{comment.resolved ? "Reopen" : "Resolve"}</button
               >
             </div>
             {#if comment.excerpt}<pre>{comment.excerpt}</pre>{/if}
             <p>{comment.text}</p>
             <small class="comment-date"
-              >{new Date(
+              >{comment.author?.name || "Previous local review"} · {new Date(
                 comment.created_at * 1000,
               ).toLocaleString()}{comment.resolved
-                ? " · Resolved by you"
+                ? " · Resolved by " +
+                  (comment.resolved_by?.name || "previous reviewer")
                 : ""}</small
             >
           </article>{/each}
@@ -544,7 +571,7 @@
     </div>
     <button
       class="primary"
-      disabled={busy || !selectedComments.length}
+      disabled={!canReview || busy || !selectedComments.length}
       onclick={requestFixes}>Request fixes <ArrowRight size={14} /></button
     >
   </div>

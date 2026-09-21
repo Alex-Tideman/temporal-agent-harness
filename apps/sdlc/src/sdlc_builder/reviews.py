@@ -176,6 +176,13 @@ def summary(root: Path, task: dict, review: dict) -> dict:
                     and checkpoint["file"]["token"] == current["token"]
                     and not issue
                 ),
+                "reviewed_by": [
+                    item[path]["reviewer"]
+                    for item in review.get("reviewers", {}).values()
+                    if path in item
+                    and item[path]["file"]["token"] == current["token"]
+                    and item[path].get("reviewer")
+                ],
                 "has_checkpoint": bool(checkpoint),
                 "since_review": bool(
                     checkpoint and checkpoint["file"]["token"] != current["token"]
@@ -294,8 +301,12 @@ def checkpoint(root: Path, task: dict, review: dict, body: ReviewFile):
     review["checkpoints"][body.path] = {"file": current, "at": time.time()}
 
 
-def add_comment(root: Path, task: dict, review: dict, body: AddComment) -> bool:
-    fingerprint = digest(body.model_dump())
+def add_comment(
+    root: Path, task: dict, review: dict, body: AddComment, author: dict | None = None
+) -> bool:
+    fingerprint = digest(
+        {**body.model_dump(), **({"author_id": author["id"]} if author else {})}
+    )
     existing = next((c for c in review["comments"] if c["id"] == body.id), None)
     if existing:
         if existing["request_hash"] != fingerprint:
@@ -333,6 +344,7 @@ def add_comment(root: Path, task: dict, review: dict, body: AddComment) -> bool:
             "excerpt": excerpt,
             "created_at": time.time(),
             "resolved": False,
+            **({"author": author} if author else {}),
         }
     )
     return True

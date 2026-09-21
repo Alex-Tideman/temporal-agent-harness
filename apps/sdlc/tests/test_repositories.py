@@ -183,7 +183,9 @@ async def test_remove_and_reconnect_preserves_files_tasks_and_identity(context):
     assert (
         await context.client.post(f"/api/projects/{project['id']}/open")
     ).status_code == 409
-    suggestion = repositories.discover(context.store)["suggestions"][0]
+    suggestion = (await context.client.get("/api/projects/discovery")).json()[
+        "suggestions"
+    ][0]
     assert not suggestion["connected_id"]
     readded = (
         await context.client.post("/api/projects", json={"path": str(source)})

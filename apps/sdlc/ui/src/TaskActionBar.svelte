@@ -29,6 +29,7 @@
       approved?: boolean,
       text?: string,
       gateId?: string,
+      expectedVersion?: number,
     ) => Promise<boolean>;
     onreview: () => void;
     oncontinue: () => void;
@@ -57,7 +58,7 @@
       progress.mode === "change" &&
       progress.verification !== "verified",
   );
-  let disabled = $derived(busy || !task.live);
+  let disabled = $derived(busy || !task.live || task.can_control === false);
   let dialog = $state<HTMLDialogElement>();
   let feedback = $state("");
   let identity = $derived(`${task.id}:${gate?.id ?? progress?.status}`);
@@ -91,7 +92,11 @@
                       : "The work is ready. Review the changes, then accept or request a follow-up."
                 : "Your changes are accepted. Merge them when you are ready to update your project.",
   );
-  const details = () => dialog?.showModal();
+  let decisionVersion = $state<number>();
+  const details = () => {
+    decisionVersion = task.version;
+    dialog?.showModal();
+  };
   async function retrySetup() {
     dialog?.close();
     await onretry();
@@ -103,12 +108,14 @@
       dialog?.close();
   }
   async function accept() {
-    if (disabled || !task.can_message) return;
+    if (busy || !task.live || task.can_accept === false || !task.can_message)
+      return;
     if (needsNote && !feedback.trim()) {
       details();
       return;
     }
-    if (await oncontrol("accept", true, feedback)) dialog?.close();
+    if (await oncontrol("accept", true, feedback, "", decisionVersion))
+      dialog?.close();
   }
 </script>
 
@@ -147,13 +154,15 @@
       {:else if task.preparation_error}
         <button onclick={details}>View error</button><button
           class="primary"
-          disabled={busy || task.preparation_running}
+          disabled={busy ||
+            task.can_control === false ||
+            task.preparation_running}
           onclick={retrySetup}>Retry setup<ArrowRight size={15} /></button
         >
       {:else if task.message_error || progress?.status === "failed"}
         <button onclick={details}>View error</button><button
           class="primary"
-          disabled={busy || !task.can_message}
+          disabled={busy || task.can_control === false || !task.can_message}
           onclick={oncontinue}>Prepare follow-up<ArrowRight size={15} /></button
         >
       {:else if progress?.status === "paused"}
@@ -166,7 +175,10 @@
         >
         <button
           class="primary"
-          disabled={disabled || !task.can_message}
+          disabled={busy ||
+            !task.live ||
+            task.can_accept === false ||
+            !task.can_message}
           onclick={details}
           ><Check size={15} />{progress.mode === "ask"
             ? "Accept answer"
@@ -175,7 +187,7 @@
       {:else if mergeReady}
         <button onclick={onreview}>Review changes</button><button
           class="primary"
-          {disabled}
+          disabled={busy || !task.live || task.can_merge === false}
           onclick={onmerge}><GitMerge size={15} />Merge into project</button
         >
       {/if}
@@ -183,6 +195,20 @@
     {#if !task.live && !task.preparation_error}<p class="action-notice">
         Reconnecting to the worker. Actions will become available when the task
         is live.
+      </p>{/if}
+    {#if task.can_control === false}<p class="action-notice">
+        {task.can_review === false
+          ? "You have read-only access to this task."
+          : task.workspace_layout === "project-worktree"
+            ? task.sandbox_status && task.sandbox_status !== "ready"
+              ? "The project sandbox needs recovery. Open Sandbox needs attention above."
+              : `${task.owner?.name ?? "Another developer"} owns this task. You can review it and coordinate changes; a handoff transfers control.`
+            : "You can review this legacy local task. Only the workspace administrator can operate it; start an E2B task for shared development."}
+      </p>{:else if task.can_accept === false && (progress?.status === "review" || mergeReady)}<p
+        class="action-notice"
+      >
+        A project maintainer or owner can accept and merge these changes. You
+        can review files and leave comments.
       </p>{/if}
     {#if error}<p class="action-error" role="alert">{error}</p>{/if}
   </section>
@@ -295,7 +321,9 @@
         >
         <button
           class="primary"
-          disabled={disabled ||
+          disabled={busy ||
+            !task.live ||
+            task.can_accept === false ||
             !task.can_message ||
             (needsNote && !feedback.trim())}
           onclick={accept}
@@ -312,11 +340,13 @@
         >
         {#if task.preparation_error}<button
             class="primary"
-            disabled={busy || task.preparation_running}
+            disabled={busy ||
+              task.can_control === false ||
+              task.preparation_running}
             onclick={retrySetup}>Retry setup<ArrowRight size={15} /></button
           >{:else}<button
             class="primary"
-            disabled={busy || !task.can_message}
+            disabled={busy || task.can_control === false || !task.can_message}
             onclick={() => {
               dialog?.close();
               oncontinue();

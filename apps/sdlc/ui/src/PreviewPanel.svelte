@@ -13,8 +13,13 @@
   } from "@lucide/svelte";
   import { api } from "./types";
 
-  let { taskId, visible }: { taskId: string; visible: boolean } = $props();
+  let {
+    taskId,
+    visible,
+    canControl = true,
+  }: { taskId: string; visible: boolean; canControl?: boolean } = $props();
   type Preview = {
+    checkpoint_error?: string;
     supported: boolean;
     status: "idle" | "starting" | "running" | "stopped";
     command?: string;
@@ -71,7 +76,7 @@
   }
 
   async function change(method: "POST" | "DELETE") {
-    if (busy || loading) return;
+    if (!canControl || busy || loading) return;
     busy = true;
     error = "";
     try {
@@ -129,7 +134,9 @@
     </div>
     <div class="preview-actions">
       {#if active || data?.launch_unconfirmed}
-        <button disabled={busy || loading} onclick={() => change("DELETE")}
+        <button
+          disabled={!canControl || busy || loading}
+          onclick={() => change("DELETE")}
           ><Square size={13} /> Stop preview</button
         >
       {/if}
@@ -138,7 +145,10 @@
           class="primary"
           type="submit"
           form={"preview-setup-" + taskId}
-          disabled={busy || loading || (custom && (!command.trim() || !port))}
+          disabled={!canControl ||
+            busy ||
+            loading ||
+            (custom && (!command.trim() || !port))}
           ><Play size={14} />{busy
             ? "Preparing…"
             : data.phase === "failed"
@@ -163,6 +173,9 @@
     </div>
   </header>
 
+  {#if data?.checkpoint_error}<div class="preview-error" role="alert">
+      {data.checkpoint_error}
+    </div>{/if}
   {#if error}
     <div class="preview-error" role="alert">
       <span>{error}</span><button

@@ -1,3 +1,11 @@
+export interface Person {
+  id: string;
+  name: string;
+}
+export interface Account extends Person {
+  email: string | null;
+  admin: number | boolean;
+}
 export interface Profile {
   available?: boolean;
   id: string;
@@ -22,6 +30,9 @@ export interface ProviderCheck {
   parameter: string;
 }
 export interface Project {
+  role?: "owner" | "maintainer" | "developer" | "viewer";
+  remote_url?: string;
+  default_branch?: string;
   id: string;
   name: string;
   path: string;
@@ -118,6 +129,20 @@ export interface State {
   } | null;
 }
 export interface Task {
+  workspace_layout?: "project-worktree";
+  owner?: Person;
+  ownership_version?: number;
+  can_handoff?: boolean;
+  worktree_branch?: string;
+  preview_port?: number;
+  sandbox_status?: string;
+  checkpoint?: { saved_at: number; revision: string };
+  created_by?: Person;
+  can_control?: boolean;
+  can_review?: boolean;
+  can_accept?: boolean;
+  can_merge?: boolean;
+  can_manage?: boolean;
   engine?: string;
   id: string;
   workflow_id: string;
@@ -210,6 +235,8 @@ export interface MessageReceipt {
   error?: string;
 }
 export interface Home {
+  shared?: boolean;
+  user?: Account;
   profiles: Profile[];
   projects: Project[];
   tasks: Task[];
@@ -224,6 +251,8 @@ export interface Home {
   };
 }
 export interface ReviewComment {
+  author?: Person;
+  resolved_by?: Person;
   id: string;
   path: string;
   side: "file" | "old" | "new";
@@ -246,6 +275,7 @@ export interface ReviewSummary {
     status: string;
     issue: string;
     reviewed: boolean;
+    reviewed_by?: Person[];
     has_checkpoint: boolean;
     since_review: boolean;
     additions: number;

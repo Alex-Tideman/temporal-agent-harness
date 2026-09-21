@@ -5,15 +5,19 @@ This module runs inside the sandbox without installing the app or its providers.
 
 import asyncio
 import base64
+import fcntl
 import hashlib
+import io
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 MAX_SNAPSHOT = 256_000_000
@@ -610,6 +614,223 @@ def export_base(root: Path, base: str = "HEAD") -> str:
         return base64.b64encode(output.read()).decode()
 
 
+@contextmanager
+def workspace_lock(root: Path, *, blocking=True):
+    """A live process owns the writer lock; timeouts never evict a live writer."""
+    locks = root.parent / ".locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    with (locks / (root.name + ".lock")).open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            raise ValueError(
+                "This worktree has an in-flight command or preview setup. Wait for it to finish."
+            ) from None
+        yield
+
+
+def project_prepare(
+    root: Path, archive_path: str, source_base: str, patch: str = ""
+) -> str:
+    """Import a sanitized base and attach an independent branch to the shared repo."""
+    import re
+
+    if not re.fullmatch(r"[a-f0-9]{32}", root.name) or not re.fullmatch(
+        r"[a-f0-9]{40,64}", source_base
+    ):
+        raise ValueError("Invalid worktree identity")
+    hub = root.parent / ".project.git"
+    ref = "refs/boltzmann/bases/" + source_base
+    receipt = root.parent / ".receipts" / (root.name + ".json")
+    fingerprint = hashlib.sha256(
+        Path(archive_path).read_bytes() + patch.encode()
+    ).hexdigest()
+    with workspace_lock(root.parent / "project"):
+        if receipt.exists():
+            value = json.loads(receipt.read_text())
+            if value["fingerprint"] != fingerprint or not root.exists():
+                raise ValueError("Worktree setup does not match its saved receipt")
+            return value["base"]
+        if root.exists():
+            raise ValueError(
+                "Unconfirmed worktree setup; existing files were preserved. Recover the project sandbox from its saved checkpoints."
+            )
+        root.parent.mkdir(parents=True, exist_ok=True)
+        if not hub.exists():
+            git(root.parent, "init", "--bare", str(hub))
+            git(hub, "config", "core.hooksPath", "/dev/null")
+        try:
+            base = git(hub, "rev-parse", "--verify", ref).strip()
+        except ValueError:
+            with tempfile.TemporaryDirectory(dir=root.parent) as temp:
+                original = Path(temp) / "source"
+                snapshot = Path(temp) / "source.tar.gz"
+                shutil.copyfile(archive_path, snapshot)
+                base = initialize(original, str(snapshot))
+                git(hub, "fetch", "--no-write-fetch-head", str(original), "HEAD:" + ref)
+        git(hub, "worktree", "add", "-b", "sdlc/" + root.name, str(root), base)
+        if patch and git_apply(root, patch).returncode:
+            raise ValueError("Could not carry forward the previous task patch")
+        receipt.parent.mkdir(exist_ok=True)
+        temporary = receipt.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"fingerprint": fingerprint, "base": base}))
+        temporary.replace(receipt)
+        return base
+
+
+def project_checkpoint(root: Path, base: str, previous_revision: str = "") -> dict:
+    """Capture code and index membership; generated files, secrets and processes stay out."""
+    before = revision(root)
+    if previous_revision and before == previous_revision:
+        return {"unchanged": True}
+    names = sorted(
+        set(
+            git(
+                root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"
+            ).split("\0")
+        )
+        - {""}
+    )
+    tracked = [
+        n for n in git(root, "ls-files", "-z", "--cached").split("\0") if allowed(n)
+    ]
+    total = count = 0
+    target = root.parent / ".checkpoints" / root.name
+    target.mkdir(parents=True, exist_ok=True)
+    archive_path = target / "source.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as archive:
+        for name in names:
+            if not allowed(name):
+                continue
+            path = safe_path(root, name, check_ignored=False)
+            if not path.exists():
+                continue
+            if not path.is_file():
+                raise ValueError("Checkpoint cannot preserve non-regular source files")
+            raw = path.read_bytes()
+            total += len(raw)
+            count += 1
+            if total > MAX_SNAPSHOT or count > 50000:
+                raise ValueError("Checkpoint exceeds source limits")
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(raw), path.stat().st_mode & 0o777
+            archive.addfile(info, io.BytesIO(raw))
+    # Only the original sanitized base enters the bundle, never other tasks' branches.
+    ref = "refs/boltzmann/checkpoint-bases/" + root.name
+    git(root, "update-ref", ref, base)
+    bundle_path = target / "base.bundle"
+    bundle_path.unlink(missing_ok=True)
+    git(root, "bundle", "create", str(bundle_path), ref)
+    after = revision(root)
+    if before != after:
+        raise ValueError(
+            "Source changed while checkpointing. The prior checkpoint was preserved; retry after setup or edits finish."
+        )
+    return {
+        "revision": after,
+        "tracked": tracked,
+        "changed_paths": changed_paths(root, base),
+        "base": base,
+        "archive": str(archive_path),
+        "bundle": str(bundle_path),
+        "archive_hash": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+        "bundle_hash": hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
+    }
+
+
+def project_restore(root: Path, checkpoint: dict, source_base: str) -> str:
+    """Restore into an empty replacement sandbox. Never reset an existing worktree."""
+    receipt = root.parent / ".restore-receipts" / (root.name + ".json")
+    expected = {
+        "archive_hash": checkpoint["archive_hash"],
+        "bundle_hash": checkpoint["bundle_hash"],
+        "revision": checkpoint["revision"],
+    }
+    saved = json.loads(receipt.read_text()) if receipt.exists() else {}
+    if root.exists():
+        if revision(root) == checkpoint["revision"]:
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            receipt.write_text(json.dumps({**expected, "complete": True}))
+            return checkpoint["base"]
+        if (
+            not saved
+            or saved.get("complete")
+            or any(saved.get(k) != v for k, v in expected.items())
+        ):
+            raise ValueError(
+                "Existing worktree differs from the recovery checkpoint; preserved it"
+            )
+        # Only retry our unfinished restore in this unpublished replacement VM.
+        # A completed worktree is never reset, even if a later edit differs.
+        project_remove(root)
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_text(json.dumps({**expected, "complete": False}))
+    hub = root.parent / ".project.git"
+    root.parent.mkdir(parents=True, exist_ok=True)
+    if not hub.exists():
+        git(root.parent, "init", "--bare", str(hub))
+    for field in ("archive", "bundle"):
+        if (
+            hashlib.sha256(Path(checkpoint[field]).read_bytes()).hexdigest()
+            != checkpoint[field + "_hash"]
+        ):
+            raise ValueError("Checkpoint checksum mismatch")
+    ref = "refs/boltzmann/checkpoint-bases/" + root.name
+    git(hub, "fetch", "--no-write-fetch-head", checkpoint["bundle"], ref + ":" + ref)
+    git(hub, "update-ref", "refs/boltzmann/bases/" + source_base, checkpoint["base"])
+    git(
+        hub, "worktree", "add", "-b", "sdlc/" + root.name, str(root), checkpoint["base"]
+    )
+    for name in git(root, "ls-files", "-z").split("\0"):
+        if allowed(name):
+            safe_path(root, name, check_ignored=False).unlink(missing_ok=True)
+    total = count = 0
+    with tarfile.open(checkpoint["archive"]) as archive:
+        for member in archive:
+            if not member.isfile() or not allowed(member.name):
+                raise ValueError("Unsafe checkpoint entry")
+            total += member.size
+            count += 1
+            if total > MAX_SNAPSHOT or count > 50000:
+                raise ValueError("Checkpoint exceeds source limits")
+            path = safe_path(root, member.name, check_ignored=False)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with archive.extractfile(member) as source, path.open("wb") as target:
+                shutil.copyfileobj(source, target)
+            path.chmod(member.mode & 0o777)
+    # Preserve index membership (including unstaged deletions) without retaining staging state.
+    git(root, "read-tree", "--empty")
+    for name in checkpoint["tracked"]:
+        path = safe_path(root, name, check_ignored=False)
+        raw = path.read_bytes() if path.is_file() else b""
+        oid = (
+            subprocess.run(
+                ["git", "hash-object", "-w", "--stdin"],
+                cwd=root,
+                input=raw,
+                capture_output=True,
+                check=True,
+            )
+            .stdout.decode()
+            .strip()
+        )
+        mode = "100755" if path.is_file() and path.stat().st_mode & 0o111 else "100644"
+        git(root, "update-index", "--add", "--cacheinfo", mode, oid, name)
+    if revision(root) != checkpoint["revision"]:
+        raise ValueError(
+            "Restored source does not match the checkpoint; review recovery before continuing"
+        )
+    receipt.write_text(json.dumps({**expected, "complete": True}))
+    return checkpoint["base"]
+
+
+def project_remove(root: Path) -> bool:
+    if root.exists():
+        git(root.parent / ".project.git", "worktree", "remove", "--force", str(root))
+        git(root.parent / ".project.git", "branch", "-D", "sdlc/" + root.name)
+    return True
+
+
 # The RPC surface is deliberately explicit. No arbitrary function or host path
 # supplied by a model is ever used as an execution entry point.
 OPERATIONS = {
@@ -632,6 +853,10 @@ OPERATIONS = {
         check_operation,
         initialize,
         export_base,
+        project_prepare,
+        project_checkpoint,
+        project_restore,
+        project_remove,
     )
 }
 
@@ -641,12 +866,22 @@ def main():
     try:
         payload = json.loads(request.read_text())
         started = time.monotonic()
-        if payload["operation"] == "execute_check":
-            result = asyncio.run(execute_check(Path(payload["root"]), *payload["args"]))
-        else:
-            result = OPERATIONS[payload["operation"]](
-                Path(payload["root"]), *payload["args"]
-            )
+        from contextlib import nullcontext
+
+        guard = (
+            workspace_lock(Path(payload["root"]), blocking=False)
+            if payload.get("shared")
+            else nullcontext()
+        )
+        with guard:
+            if payload["operation"] == "execute_check":
+                result = asyncio.run(
+                    execute_check(Path(payload["root"]), *payload["args"])
+                )
+            else:
+                result = OPERATIONS[payload["operation"]](
+                    Path(payload["root"]), *payload["args"]
+                )
         print(
             json.dumps(
                 {

@@ -47,6 +47,9 @@ def remote(tmp_path, monkeypatch):
 
     def run(command, *, background=False, **_kwargs):
         args = shlex.split(command)
+        if args[0] == "mkdir":
+            Path(args[-1]).mkdir(parents=True, exist_ok=True)
+            return SimpleNamespace(stdout="")
         args[0] = sys.executable
         if background:
             launches.append(command)

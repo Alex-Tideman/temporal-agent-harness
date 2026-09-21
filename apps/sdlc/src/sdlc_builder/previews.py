@@ -13,7 +13,7 @@ from pathlib import Path
 
 import httpx
 
-from . import preview_runtime, sandbox, workspaces
+from . import preview_runtime, project_workspaces, sandbox, workspaces
 from .store import data_dir
 
 
@@ -84,11 +84,22 @@ def _client(root: Path):
     meta = json.loads(sandbox.descriptor(root).read_text())
     if meta.get("status") != "ready":
         raise ValueError("Wait for the sandbox workspace to finish preparing")
+    if meta.get("project_id"):
+        project = project_workspaces.project_state(meta["project_id"])
+        if project.get("status") != "ready" or project.get("generation") != meta.get(
+            "generation"
+        ):
+            raise ValueError(
+                "Finish project sandbox recovery before using its previews"
+            )
     return sandbox._client(meta)
 
 
 def _paths(value: dict) -> tuple[str, str]:
-    return value["script"], f"{sandbox.CONTROL_ROOT}/preview-{value['run_id']}.json"
+    return (
+        value["script"],
+        f"{value.get('control_root', sandbox.CONTROL_ROOT)}/preview-{value['run_id']}.json",
+    )
 
 
 def _operation(client, value: dict, operation: str) -> dict:
@@ -217,8 +228,8 @@ def inspect(root: Path) -> dict:
     if value.get("stopped"):
         return _public({**value, "supported": True, "status": "stopped", "url": ""})
     client = _client(root)
-    client.set_timeout(sandbox.IDLE_TIMEOUT)
     result = _operation(client, value, "status")
+    client.set_timeout(sandbox.IDLE_TIMEOUT)
     return _public({**value, **result, "supported": True})
 
 
@@ -237,7 +248,14 @@ def start(
             )
         command = plan["command"]
     cwd = cwd if cwd is not None else plan.get("cwd", ".")
-    port = port if port is not None else plan.get("port", 3000)
+    if project_workspaces.shared(root):
+        port = (
+            port
+            if port is not None
+            else project_workspaces.task_meta(root)["preview_port"]
+        )
+    else:
+        port = port if port is not None else plan.get("port", 3000)
     command, cwd = command.strip(), cwd.strip() or "."
     if not command or len(command) > 4000 or "\0" in command:
         raise ValueError("Enter a start command of at most 4,000 characters")
@@ -261,6 +279,8 @@ def start(
             raise ValueError(
                 "The previous preview launch is unconfirmed. Check its logs and stop it before trying again."
             )
+    if project_workspaces.shared(root):
+        port = project_workspaces.reserve_port(root, port)
     host = client.get_host(port)
     if not re.fullmatch(r"[a-zA-Z0-9.-]+", host):
         raise ValueError("E2B returned an invalid preview hostname")
@@ -279,18 +299,29 @@ def start(
         "framework": plan.get("framework", "Custom command"),
         "detected": plan.get("detected", True),
     }
+    if project_workspaces.shared(root):
+        value["control_root"] = sandbox.CONTROL_ROOT + "/previews/" + root.name
+        client.commands.run(
+            shlex.join(["mkdir", "-p", value["control_root"]]), timeout=15
+        )
     _, config = _paths(value)
     client.files.write(script, source)
     client.files.write(
         config,
         json.dumps(
             {
-                "root": sandbox.REMOTE_ROOT,
+                "root": project_workspaces.task_meta(root).get(
+                    "remote_root", sandbox.REMOTE_ROOT
+                ),
+                "home": value.get("control_root", "") + "/home"
+                if value.get("control_root")
+                else "",
                 "command": command,
                 "cwd": cwd,
                 "port": port,
                 "host": host,
                 "setup": plan.get("setup"),
+                "shared": project_workspaces.shared(root),
             }
         ),
     )
@@ -319,6 +350,14 @@ def start(
             "logs": "",
         }
     )
+
+
+@serialized
+def mark_checkpointed(root: Path, run_id: str):
+    value = saved(root)
+    if value.get("run_id") == run_id:
+        value["checkpointed"] = True
+        _save(root, value)
 
 
 @serialized

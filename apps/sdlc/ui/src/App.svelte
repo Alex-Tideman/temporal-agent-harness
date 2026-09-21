@@ -31,6 +31,8 @@
     LayoutDashboard,
     Server,
     Monitor,
+    Users,
+    LogOut,
   } from "@lucide/svelte";
   import {
     api,
@@ -43,6 +45,10 @@
     type MessageDraft,
     type MessageReceipt,
   } from "./types";
+  import AccountAccess from "./AccountAccess.svelte";
+  import ProjectMembers from "./ProjectMembers.svelte";
+  import TeamActivity from "./TeamActivity.svelte";
+  import SharedWorkspace from "./SharedWorkspace.svelte";
   import ExecutionWorkspace from "./ExecutionWorkspace.svelte";
   import ReviewPanel from "./ReviewPanel.svelte";
   import PreviewPanel from "./PreviewPanel.svelte";
@@ -87,6 +93,77 @@
   let mergeError = $state("");
   let locked = $state(false);
   let unlockToken = $state("");
+  let auth = $state({ shared: false, setup_required: false });
+  let authReady = $state(false);
+  let accountEpoch = 0;
+  let authInvite = $state("");
+  let storagePrefix = $state("sdlc.");
+  let memberDialog = $state<{ show: (project: Project) => Promise<void> }>();
+  let hiddenProjects = $state<Project[]>([]);
+  const storageKey = (name: string) => storagePrefix + name;
+  async function loadPersonalState() {
+    draftsLoaded = false;
+    storagePrefix = home?.shared ? `sdlc.user.${home.user?.id}.` : "sdlc.";
+    prompt = localStorage.getItem(storageKey("draft")) ?? "";
+    try {
+      messageDrafts = JSON.parse(
+        localStorage.getItem(storageKey("message-drafts")) ?? "{}",
+      );
+    } catch {
+      messageDrafts = {};
+    }
+    draftsLoaded = true;
+    const remembered = home?.tasks.find(
+      (t) => t.id === localStorage.getItem(storageKey("active")),
+    );
+    if (remembered) await selectTask(remembered);
+  }
+  async function authenticated() {
+    accountEpoch += 1;
+    authInvite = "";
+    unlockToken = "";
+    locked = false;
+    auth.setup_required = false;
+    await refresh();
+  }
+  async function signOut() {
+    if (
+      fileText !== originalText &&
+      !confirm("Discard unsaved file changes and sign out?")
+    )
+      return;
+    await attempt(async () => {
+      await api("/auth/logout", "POST", {});
+      clearAccountState();
+      locked = true;
+    });
+  }
+  function clearAccountState() {
+    accountEpoch += 1;
+    selection += 1;
+    draftsLoaded = false;
+    home = null;
+    active = null;
+    messageDrafts = {};
+    prompt = "";
+    fileText = originalText = "";
+    selectedRepositoryId = projectId = "";
+    composer = false;
+    view = "workspace";
+    hiddenProjects = [];
+    messageErrors = {};
+    error = toast = apiKey = "";
+  }
+  async function loadHiddenProjects() {
+    hiddenProjects = await api<Project[]>("/projects/hidden");
+  }
+  async function showProject(item: Project) {
+    await attempt(async () => {
+      await api(`/projects/${item.id}/show`, "POST", {});
+      await loadHiddenProjects();
+      await refresh();
+    });
+  }
   let projectId = $state("");
   let selectedRepositoryId = $state("");
   let selectedRepository = $derived(
@@ -169,6 +246,7 @@
   );
   let canSendMessage = $derived(
     Boolean(
+      active?.can_control !== false &&
       active?.can_message &&
       messageDraft?.prompt.trim() &&
       messageProfiles.some((p) => p.id === messageDraft?.profile_id) &&
@@ -184,7 +262,7 @@
     if (draftsLoaded) {
       try {
         localStorage.setItem(
-          "sdlc.message-drafts",
+          storageKey("message-drafts"),
           JSON.stringify(messageDrafts),
         );
       } catch {
@@ -236,7 +314,8 @@
     ) ?? [],
   );
   let editable = $derived(
-    active?.live &&
+    active?.can_control !== false &&
+      active?.live &&
       !active.pending_message &&
       (progress?.status === "paused" || active.can_message) &&
       ["paused", "review", "failed", "cancelled"].includes(
@@ -244,8 +323,9 @@
       ),
   );
   let canDelete = $derived(
-    (active?.dispatch === "preparing" && !active.preparation_running) ||
-      active?.can_message,
+    active?.can_manage !== false &&
+      ((active?.dispatch === "preparing" && !active.preparation_running) ||
+        active?.can_message),
   );
   let lastGate = "";
   let selection = 0;
@@ -282,18 +362,28 @@
     }
   }
   async function refresh() {
-    if (refreshing) return;
+    if (refreshing || !authReady || locked) return;
     refreshing = true;
     const selectedIdentity = active?.id;
+    const epoch = accountEpoch;
     try {
-      home = await api<Home>("/home");
+      const nextHome = await api<Home>("/home");
+      if (epoch !== accountEpoch || locked) return;
+      if (!home || (home.shared && home.user?.id !== nextHome.user?.id)) {
+        if (home) clearAccountState();
+        home = nextHome;
+        projectId = workspaceProjects[0]?.id ?? "";
+        await loadPersonalState();
+        return;
+      }
+      home = nextHome;
       locked = false;
       if (!workspaceProjects.some((project) => project.id === projectId))
         projectId = workspaceProjects[0]?.id ?? "";
       if (active) {
         const identity = active.id;
         const next = await api<Task>("/tasks/" + identity);
-        if (active?.id !== identity) return;
+        if (epoch !== accountEpoch || active?.id !== identity) return;
         active = next;
         const draft = messageDrafts[identity];
         if (
@@ -322,9 +412,20 @@
         }
       }
     } catch (e) {
-      if (!home) locked = true;
-      else if (!selectedIdentity || active?.id === selectedIdentity)
+      if (epoch !== accountEpoch) return;
+      if (e instanceof ApiError && e.status === 401) {
+        clearAccountState();
+        locked = true;
+      } else if (!home) error = (e as Error).message;
+      else if (!selectedIdentity || active?.id === selectedIdentity) {
+        if (e instanceof ApiError && (e.status === 403 || e.status === 404)) {
+          ++selection;
+          active = null;
+          selectedRepositoryId = "";
+          fileText = originalText = "";
+        }
         error = (e as Error).message;
+      }
     } finally {
       refreshing = false;
     }
@@ -363,6 +464,7 @@
       const result = await api<ProjectMerge>(
         "/tasks/" + identity + "/merge",
         "POST",
+        { expected_version: mergeTarget.version },
       );
       closeMergeDialog();
       const count = result.files.length;
@@ -394,10 +496,10 @@
         selectedFile = "";
         fileText = "";
         originalText = "";
-        localStorage.removeItem("sdlc.active");
+        localStorage.removeItem(storageKey("active"));
       }
       if (parentTaskId === identity) parentTaskId = "";
-      localStorage.removeItem("sdlc.review-draft." + identity);
+      localStorage.removeItem(storageKey("review-draft.") + identity);
       delete messageDrafts[identity];
       delete messageErrors[identity];
       if (home) home.tasks = home.tasks.filter((task) => task.id !== identity);
@@ -438,7 +540,7 @@
     fileText = "";
     originalText = "";
     lastGate = "";
-    localStorage.setItem("sdlc.active", task.id);
+    localStorage.setItem(storageKey("active"), task.id);
   }
   function openOverview() {
     if (
@@ -456,7 +558,7 @@
     selectedFile = "";
     fileText = "";
     originalText = "";
-    localStorage.removeItem("sdlc.active");
+    localStorage.removeItem(storageKey("active"));
     return true;
   }
   function rememberRepository(identity: string) {
@@ -493,7 +595,7 @@
           prompt,
           parent_task_id: parentTaskId,
         });
-        localStorage.removeItem("sdlc.draft");
+        localStorage.removeItem(storageKey("draft"));
         prompt = "";
         parentTaskId = "";
         await selectTask(task);
@@ -534,7 +636,7 @@
       } else if (selectedRepositoryId === item.id) selectedRepositoryId = "";
       if (projectId === item.id) projectId = workspaceProjects[0]?.id ?? "";
       removeRepositoryDialog?.close();
-      toast = `${item.name} removed. Add the same folder again to restore its tasks.`;
+      toast = `${item.name} hidden from your sidebar. Restore it from Hidden repositories in Settings.`;
     } catch (e) {
       removeRepositoryError = (e as Error).message;
     } finally {
@@ -582,12 +684,14 @@
     approved = true,
     text = "",
     gateId = progress?.gate?.id ?? "",
+    expectedVersion = active?.version,
   ) {
     let succeeded = false;
     await attempt(async () => {
       await api("/tasks/" + active!.id + "/control", "POST", {
         command,
         gate_id: gateId,
+        expected_version: expectedVersion,
         approved,
         text,
       });
@@ -811,8 +915,19 @@
     await attempt(async () => {
       await api("/unlock", "POST", { token: unlockToken });
       unlockToken = "";
+      locked = false;
       await refresh();
     });
+  }
+  function openAccountLink() {
+    if (!authReady) return;
+    const fragment = new URLSearchParams(location.hash.slice(1));
+    if (auth.shared && fragment.has("invite")) {
+      clearAccountState();
+      authInvite = fragment.get("invite") ?? "";
+      locked = true;
+      history.replaceState(null, "", location.pathname);
+    }
   }
   function keyboard(event: KeyboardEvent) {
     if (
@@ -832,48 +947,55 @@
     if (event.key === "Escape") composer = false;
   }
   onMount(() => {
-    let disposed = false;
     (async () => {
-      const fragment = new URLSearchParams(location.hash.slice(1));
-      if (fragment.has("token")) {
-        try {
-          await api("/unlock", "POST", { token: fragment.get("token") });
-        } catch (e) {
-          error = (e as Error).message;
-        }
-        history.replaceState(null, "", location.pathname);
-      }
-      prompt = localStorage.getItem("sdlc.draft") ?? "";
       try {
-        messageDrafts = JSON.parse(
-          localStorage.getItem("sdlc.message-drafts") ?? "{}",
+        const fragment = new URLSearchParams(location.hash.slice(1));
+        const status = await api<typeof auth & { user: unknown }>(
+          "/auth/status",
         );
-      } catch {
-        messageDrafts = {};
+        auth = status;
+        unlockToken = fragment.get("token") ?? "";
+        authInvite = fragment.get("invite") ?? "";
+        history.replaceState(null, "", location.pathname);
+        if (status.shared) locked = !status.user || !!authInvite;
+        else if (unlockToken)
+          await api("/unlock", "POST", { token: unlockToken });
+        authReady = true;
+        if (!locked) {
+          await refresh();
+        }
+      } catch (e) {
+        authReady = true;
+        locked = true;
+        error = (e as Error).message;
       }
-      draftsLoaded = true;
-      await refresh();
-      const remembered = home?.tasks.find(
-        (t) => t.id === localStorage.getItem("sdlc.active"),
-      );
-      if (remembered && !disposed) await selectTask(remembered);
     })();
     const timer = setInterval(refresh, 2000);
-    return () => {
-      disposed = true;
-      clearInterval(timer);
-    };
+    return () => clearInterval(timer);
   });
 </script>
 
 <svelte:window
+  onhashchange={openAccountLink}
   onkeydown={keyboard}
   onbeforeunload={(event) => {
     if (fileText !== originalText) event.preventDefault();
   }}
 />
 
-{#if locked}
+{#if !authReady}
+  <main class="unlock"><p role="status">Opening workspace…</p></main>
+{:else if locked && auth.shared}
+  <AccountAccess
+    setup={auth.setup_required}
+    token={unlockToken}
+    invite={authInvite}
+    onauthenticated={authenticated}
+    oncancel={() => {
+      authInvite = "";
+    }}
+  />
+{:else if locked}
   <main class="unlock">
     <div class="brandmark" aria-hidden="true">
       <Brain class="brand-icon" size={23} strokeWidth={1.75} />
@@ -974,6 +1096,13 @@
           >
         </div>
         <div class="topbar-right">
+          {#if home?.shared}<span class="account-name">{home.user?.name}</span
+            ><button
+              class="icon-button"
+              title="Sign out"
+              aria-label="Sign out"
+              onclick={signOut}><LogOut size={16} /></button
+            >{/if}
           {#if attentionTasks.length}
             <details class="attention-menu" bind:this={attentionMenu}>
               <summary
@@ -1044,15 +1173,17 @@
             <div>
               <h2>Repositories</h2>
               <p>
-                Choose a local Git repository to start working. Tasks start in
-                an isolated workspace from the latest commit.
+                Connect a Git repository to start working. Tasks start in an
+                isolated workspace from the latest commit.
               </p>
             </div>
             <div class="settings-body">
               {#each workspaceProjects as item}<div class="repository-card">
                   <FolderOpen size={18} />
                   <div>
-                    <strong>{item.name}</strong><code>{item.path}</code>
+                    <strong>{item.name}</strong><code
+                      >{item.remote_url || item.path}</code
+                    >
                   </div>
                   {#if item.github_url}<a
                       href={item.github_url}
@@ -1061,10 +1192,28 @@
                       aria-label="Open GitHub repository"
                       ><ArrowUpRight size={17} /></a
                     >{/if}
+                  {#if home?.shared}<button
+                      class="icon-button"
+                      aria-label={"Manage " + item.name + " members"}
+                      title="Project members"
+                      onclick={() => memberDialog?.show(item)}
+                      ><Users size={16} /></button
+                    >{/if}
+                  {#if item.remote_url && item.role !== "viewer" && item.role !== "developer"}<button
+                      class="icon-button"
+                      title="Sync default branch from GitHub"
+                      aria-label={"Sync " + item.name}
+                      disabled={busy}
+                      onclick={() =>
+                        attempt(async () => {
+                          await api(`/projects/${item.id}/sync`, "POST", {});
+                          toast = "Repository synced from GitHub";
+                        })}><RefreshCw size={16} /></button
+                    >{/if}
                   <button
                     class="icon-button"
-                    aria-label={"Remove " + item.name + " repository"}
-                    title="Remove repository"
+                    aria-label={"Hide " + item.name + " repository"}
+                    title="Hide repository"
                     onclick={() => confirmRemoveRepository(item)}
                     ><Trash2 size={16} /></button
                   >
@@ -1074,201 +1223,221 @@
                 onclick={() => repositoryDialog?.show()}
                 ><Plus size={15} />Add repository</button
               >
-            </div>
-          </section>
-          <section class="settings-section">
-            <div>
-              <h2>Model profiles</h2>
-              <p>
-                Keys are stored in your OS keyring. Environment references are
-                also supported. Each task keeps a snapshot of its profile. New
-                tasks use OpenAI model profiles.
-              </p>
-            </div>
-            <div class="settings-body">
-              <p class="provider-test-help">
-                Test connection makes one model request using the saved
-                credential and the agent's action schema. Provider charges may
-                apply. No repository content is sent.
-              </p>
-              {#each configuredProfiles as item}
-                {@const result = providerChecks[item.id]}
-                <div class="profile-group">
-                  <div class="profile-card">
-                    <div class="provider-icon"><Code2 size={16} /></div>
-                    <div class="profile-identity">
-                      <strong>{item.label}</strong><small
-                        >{item.provider}
-                        {item.model
-                          ? " / " + item.model
-                          : " · scripted walkthrough"}</small
-                      >
-                    </div>
-                    <span class="tiny-pill">{item.max_steps} calls</span>
-                    {#if item.id !== "demo"}
-                      <button
-                        class="secondary provider-test-button"
-                        aria-label={"Test connection for " + item.label}
-                        disabled={busy ||
-                          testingProfiles[item.id] ||
-                          item.available === false}
-                        onclick={() => testProvider(item.id)}
-                        ><Activity size={14} />{testingProfiles[item.id]
-                          ? "Testing…"
-                          : "Test connection"}</button
-                      >
-                      <button
-                        class="icon-button"
-                        aria-label={"Remove profile " + item.label}
-                        disabled={busy || testingProfiles[item.id]}
-                        onclick={() => removeProfile(item.id)}
-                        ><X size={14} /></button
-                      >{/if}
-                  </div>
-                  {#if item.available === false}<p class="provider-test-help">
-                      Saved for existing tasks. Add an OpenAI profile for new
-                      work; other integrations will return in a future
-                      milestone.
-                    </p>{/if}
-                  <div aria-live="polite" aria-atomic="true">
-                    {#if testingProfiles[item.id]}
-                      <div class="provider-check">
-                        Reading the saved credential and checking the model's
-                        structured response… This can take up to 45 seconds.
-                      </div>
-                    {:else if providerCheckErrors[item.id]}
-                      <div class="provider-check failed">
-                        <strong>Test unavailable</strong>
-                        <p>{providerCheckErrors[item.id]}</p>
-                      </div>
-                    {:else if result}
-                      <div
-                        class="provider-check"
-                        class:passed={result.ok}
-                        class:failed={!result.ok}
-                      >
-                        <div class="provider-check-heading">
-                          {#if result.ok}<ShieldCheck
-                              size={18}
-                            />{:else}<AlertCircle size={18} />{/if}
-                          <strong>{result.title}</strong>
-                          <span>{(result.elapsed_ms / 1000).toFixed(1)}s</span>
-                        </div>
-                        <p>{result.explanation}</p>
-                        <dl>
-                          <div>
-                            <dt>Credential</dt>
-                            <dd>{result.credential_source}</dd>
-                          </div>
-                          <div>
-                            <dt>
-                              {result.ok ? "Completed" : "Stopped during"}
-                            </dt>
-                            <dd>
-                              {{
-                                credential: "Read credential",
-                                request: "Provider request",
-                                response: "Validate agent response",
-                              }[result.stage]}
-                            </dd>
-                          </div>
-                          {#if result.endpoint}<div>
-                              <dt>Endpoint</dt>
-                              <dd><code>{result.endpoint}</code></dd>
-                            </div>{/if}
-                          {#if result.http_status}<div>
-                              <dt>HTTP status</dt>
-                              <dd>{result.http_status}</dd>
-                            </div>{/if}
-                          {#if result.provider_code}<div>
-                              <dt>Provider code</dt>
-                              <dd><code>{result.provider_code}</code></dd>
-                            </div>{/if}
-                          {#if result.parameter}<div>
-                              <dt>Rejected parameter</dt>
-                              <dd><code>{result.parameter}</code></dd>
-                            </div>{/if}
-                        </dl>
-                        {#if result.provider_message}<div
-                            class="provider-message"
-                          >
-                            <strong
-                              >Provider message · credentials redacted</strong
-                            >
-                            <pre>{result.provider_message}</pre>
-                          </div>{/if}
-                        <ol>
-                          {#each result.actions as action}<li>
-                              {action}
-                            </li>{/each}
-                        </ol>
-                      </div>
-                    {/if}
-                  </div>
-                </div>{/each}
-              <form
-                class="profile-form"
-                onsubmit={(e) => {
-                  e.preventDefault();
-                  saveProfile();
+              <details
+                class="hidden-projects"
+                ontoggle={(event) => {
+                  if (event.currentTarget.open)
+                    void attempt(loadHiddenProjects);
                 }}
               >
-                <h3>Add a provider</h3>
-                <div class="form-grid">
-                  <label
-                    >Profile name<input
-                      bind:value={label}
-                      placeholder="My daily model"
-                      required
-                    /></label
-                  ><label
-                    >Provider<select bind:value={provider}
-                      ><option value="openai">OpenAI</option></select
-                    ></label
-                  >
-                </div>
-                <label
-                  >Model ID<input
-                    bind:value={model}
-                    placeholder="Enter a model available to your account"
-                    required
-                  /></label
-                >{#if provider === "compatible"}<label
-                    >API base URL<input
-                      type="url"
-                      bind:value={baseUrl}
-                      placeholder="https://provider.example/v1"
-                      required
-                    /></label
-                  >{/if}
-                <div class="form-grid">
-                  <label
-                    >API key <span class="muted">→ OS keyring</span><input
-                      type="password"
-                      bind:value={apiKey}
-                      autocomplete="new-password"
-                      placeholder="Never stored in the task history"
-                    /></label
-                  ><label
-                    >Or environment variable<input
-                      bind:value={envVar}
-                      placeholder="OPENAI_API_KEY"
-                    /></label
-                  >
-                </div>
-                <label
-                  >Maximum model calls per task<input
-                    type="number"
-                    min="3"
-                    max="200"
-                    bind:value={maxSteps}
-                  /></label
-                ><button class="primary" disabled={busy}
-                  >Save profile <ArrowRight size={15} /></button
-                >
-              </form>
+                <summary>Hidden repositories</summary>
+                {#each hiddenProjects as item}<div class="repository-card">
+                    <span>{item.name}</span><button
+                      onclick={() => showProject(item)}
+                      disabled={busy}>Show repository</button
+                    >
+                  </div>{:else}<p class="state-caption">
+                    No hidden repositories.
+                  </p>{/each}
+              </details>
             </div>
           </section>
+          {#if !home?.shared || home.user?.admin}
+            <section class="settings-section">
+              <div>
+                <h2>Model profiles</h2>
+                <p>
+                  Keys are stored in your OS keyring. Environment references are
+                  also supported. Each task keeps a snapshot of its profile. New
+                  tasks use OpenAI model profiles.
+                </p>
+              </div>
+              <div class="settings-body">
+                <p class="provider-test-help">
+                  Test connection makes one model request using the saved
+                  credential and the agent's action schema. Provider charges may
+                  apply. No repository content is sent.
+                </p>
+                {#each configuredProfiles as item}
+                  {@const result = providerChecks[item.id]}
+                  <div class="profile-group">
+                    <div class="profile-card">
+                      <div class="provider-icon"><Code2 size={16} /></div>
+                      <div class="profile-identity">
+                        <strong>{item.label}</strong><small
+                          >{item.provider}
+                          {item.model
+                            ? " / " + item.model
+                            : " · scripted walkthrough"}</small
+                        >
+                      </div>
+                      <span class="tiny-pill">{item.max_steps} calls</span>
+                      {#if item.id !== "demo"}
+                        <button
+                          class="secondary provider-test-button"
+                          aria-label={"Test connection for " + item.label}
+                          disabled={busy ||
+                            testingProfiles[item.id] ||
+                            item.available === false}
+                          onclick={() => testProvider(item.id)}
+                          ><Activity size={14} />{testingProfiles[item.id]
+                            ? "Testing…"
+                            : "Test connection"}</button
+                        >
+                        <button
+                          class="icon-button"
+                          aria-label={"Remove profile " + item.label}
+                          disabled={busy || testingProfiles[item.id]}
+                          onclick={() => removeProfile(item.id)}
+                          ><X size={14} /></button
+                        >{/if}
+                    </div>
+                    {#if item.available === false}<p class="provider-test-help">
+                        Saved for existing tasks. Add an OpenAI profile for new
+                        work; other integrations will return in a future
+                        milestone.
+                      </p>{/if}
+                    <div aria-live="polite" aria-atomic="true">
+                      {#if testingProfiles[item.id]}
+                        <div class="provider-check">
+                          Reading the saved credential and checking the model's
+                          structured response… This can take up to 45 seconds.
+                        </div>
+                      {:else if providerCheckErrors[item.id]}
+                        <div class="provider-check failed">
+                          <strong>Test unavailable</strong>
+                          <p>{providerCheckErrors[item.id]}</p>
+                        </div>
+                      {:else if result}
+                        <div
+                          class="provider-check"
+                          class:passed={result.ok}
+                          class:failed={!result.ok}
+                        >
+                          <div class="provider-check-heading">
+                            {#if result.ok}<ShieldCheck
+                                size={18}
+                              />{:else}<AlertCircle size={18} />{/if}
+                            <strong>{result.title}</strong>
+                            <span>{(result.elapsed_ms / 1000).toFixed(1)}s</span
+                            >
+                          </div>
+                          <p>{result.explanation}</p>
+                          <dl>
+                            <div>
+                              <dt>Credential</dt>
+                              <dd>{result.credential_source}</dd>
+                            </div>
+                            <div>
+                              <dt>
+                                {result.ok ? "Completed" : "Stopped during"}
+                              </dt>
+                              <dd>
+                                {{
+                                  credential: "Read credential",
+                                  request: "Provider request",
+                                  response: "Validate agent response",
+                                }[result.stage]}
+                              </dd>
+                            </div>
+                            {#if result.endpoint}<div>
+                                <dt>Endpoint</dt>
+                                <dd><code>{result.endpoint}</code></dd>
+                              </div>{/if}
+                            {#if result.http_status}<div>
+                                <dt>HTTP status</dt>
+                                <dd>{result.http_status}</dd>
+                              </div>{/if}
+                            {#if result.provider_code}<div>
+                                <dt>Provider code</dt>
+                                <dd><code>{result.provider_code}</code></dd>
+                              </div>{/if}
+                            {#if result.parameter}<div>
+                                <dt>Rejected parameter</dt>
+                                <dd><code>{result.parameter}</code></dd>
+                              </div>{/if}
+                          </dl>
+                          {#if result.provider_message}<div
+                              class="provider-message"
+                            >
+                              <strong
+                                >Provider message · credentials redacted</strong
+                              >
+                              <pre>{result.provider_message}</pre>
+                            </div>{/if}
+                          <ol>
+                            {#each result.actions as action}<li>
+                                {action}
+                              </li>{/each}
+                          </ol>
+                        </div>
+                      {/if}
+                    </div>
+                  </div>{/each}
+                <form
+                  class="profile-form"
+                  onsubmit={(e) => {
+                    e.preventDefault();
+                    saveProfile();
+                  }}
+                >
+                  <h3>Add a provider</h3>
+                  <div class="form-grid">
+                    <label
+                      >Profile name<input
+                        bind:value={label}
+                        placeholder="My daily model"
+                        required
+                      /></label
+                    ><label
+                      >Provider<select bind:value={provider}
+                        ><option value="openai">OpenAI</option></select
+                      ></label
+                    >
+                  </div>
+                  <label
+                    >Model ID<input
+                      bind:value={model}
+                      placeholder="Enter a model available to your account"
+                      required
+                    /></label
+                  >{#if provider === "compatible"}<label
+                      >API base URL<input
+                        type="url"
+                        bind:value={baseUrl}
+                        placeholder="https://provider.example/v1"
+                        required
+                      /></label
+                    >{/if}
+                  <div class="form-grid">
+                    <label
+                      >API key <span class="muted">→ OS keyring</span><input
+                        type="password"
+                        bind:value={apiKey}
+                        autocomplete="new-password"
+                        placeholder="Never stored in the task history"
+                      /></label
+                    ><label
+                      >Or environment variable<input
+                        bind:value={envVar}
+                        placeholder="OPENAI_API_KEY"
+                      /></label
+                    >
+                  </div>
+                  <label
+                    >Maximum model calls per task<input
+                      type="number"
+                      min="3"
+                      max="200"
+                      bind:value={maxSteps}
+                    /></label
+                  ><button class="primary" disabled={busy}
+                    >Save profile <ArrowRight size={15} /></button
+                  >
+                </form>
+              </div>
+            </section>
+          {/if}
           <section class="settings-section">
             <div>
               <h2>Runtime</h2>
@@ -1405,7 +1574,7 @@
                   bind:value={prompt}
                   oninput={(event) =>
                     localStorage.setItem(
-                      "sdlc.draft",
+                      storageKey("draft"),
                       event.currentTarget.value,
                     )}
                   onkeydown={(event) => {
@@ -1448,6 +1617,8 @@
                   ><button
                     class="primary"
                     disabled={busy ||
+                      workspaceProjects.find((p) => p.id === projectId)
+                        ?.role === "viewer" ||
                       !projectId ||
                       !profileId ||
                       !prompt.trim()}
@@ -1456,6 +1627,12 @@
                   >
                 </div>
               </form>
+              {#if workspaceProjects.find((item) => item.id === projectId)?.role === "viewer"}<p
+                  class="state-caption"
+                >
+                  You have read-only access. A project owner can give you
+                  developer access to start tasks.
+                </p>{/if}
               <div class="compose-foot">
                 <ShieldCheck size={13} />{startingTask
                   ? "Selecting the environment and preparing your workspace. First-time setup can take a few minutes."
@@ -1475,7 +1652,9 @@
               <p>
                 {!workspaceProjects.length
                   ? "Connect a repository"
-                  : "Add a model profile"} to start your first task.
+                  : home?.shared && !home.user?.admin
+                    ? "Ask your workspace administrator to add a model profile"
+                    : "Add a model profile"} to start your first task.
               </p>
               <button
                 onclick={() =>
@@ -1531,7 +1710,10 @@
                       ></span
                     >
                     <span class="recent-repo"
-                      ><GitBranch size={13} />{task.project_name}</span
+                      ><GitBranch
+                        size={13}
+                      />{task.project_name}{#if home?.shared && task.created_by}
+                        · {task.created_by.name}{/if}</span
                     >
                     <span
                       class="recent-status"
@@ -1610,6 +1792,16 @@
               <RefreshCw size={15} />Reconnecting. Showing the last saved state;
               controls will resume with the worker.
             </div>{/if}
+          {#if home?.shared && active.workspace_layout === "project-worktree"}
+            {#key active.id}<SharedWorkspace
+                task={active}
+                onrefresh={refresh}
+                onopen={(id) => {
+                  const selected = home?.tasks.find((t) => t.id === id);
+                  if (selected) selectTask(selected);
+                }}
+              />{/key}
+          {/if}
           <section class="progress-strip">
             <div class="progress-current">
               <span
@@ -1641,29 +1833,35 @@
                     ><Check size={14} /> Merged into project</button
                   >{:else}<button
                     class="primary"
-                    disabled={busy || !active.live}
+                    disabled={busy ||
+                      !active.live ||
+                      active.can_merge === false}
                     onclick={confirmMerge}
                     title="Write the accepted changes into the project checkout"
                     ><GitMerge size={14} /> Merge into project</button
                   >{/if}
               {/if}{#if progress?.status === "running"}<button
-                  disabled={busy}
+                  disabled={busy || active.can_control === false}
                   onclick={() => control("pause")}
                   ><Pause size={14} /> Pause</button
                 >{/if}{#if progress?.status === "paused"}<button
-                  disabled={busy}
+                  disabled={busy || active.can_control === false}
                   onclick={() => control("resume")}
                   ><Play size={14} /> Resume</button
                 >{/if}{#if ["running", "paused", "needs_you"].includes(progress?.status ?? "")}<button
                   class="icon-button"
                   title="Stop after the current action"
-                  disabled={busy}
+                  disabled={busy ||
+                    (active.can_control === false &&
+                      active.can_manage === false)}
                   onclick={() => control("cancel")}><Square size={14} /></button
                 >{/if}{#if ["review", "failed", "cancelled", "accepted"].includes(progress?.status ?? "")}<button
+                  disabled={active.can_control === false}
                   onclick={continueTask}
                   >Continue <ArrowRight size={14} /></button
                 >{/if}
               {#if active.can_message && !project?.demo}<button
+                  disabled={active.can_control === false}
                   onclick={forkTask}
                   title="Create a separate task from this workspace"
                   ><GitBranch size={14} /> Fork task</button
@@ -1680,7 +1878,7 @@
           <div class="task-columns">
             <section class="task-work">
               <nav class="tabs" aria-label="Task views">
-                {#each [{ id: "activity", label: "Execution", icon: Activity }, { id: "preview", label: "Preview", icon: Monitor }, { id: "diff", label: "Review", icon: Code2 }, { id: "files", label: "Files", icon: Files }, { id: "checks", label: "Checks", icon: Terminal }, { id: "debug", label: "Harness", icon: Activity }] as item}<button
+                {#each [{ id: "activity", label: "Execution", icon: Activity }, { id: "preview", label: "Preview", icon: Monitor }, { id: "diff", label: "Review", icon: Code2 }, { id: "files", label: "Files", icon: Files }, { id: "checks", label: "Checks", icon: Terminal }, { id: "team", label: "Team activity", icon: Users }, { id: "debug", label: "Harness", icon: Activity }].filter( (item) => (item.id === "team" ? home?.shared : item.id !== "debug" || !home?.shared) ) as item}<button
                     class:active={tab === item.id}
                     onclick={() => selectTab(item.id)}
                     ><item.icon
@@ -1695,11 +1893,14 @@
                   <PreviewPanel
                     taskId={active.id}
                     visible={tab === "preview"}
+                    canControl={active.can_control !== false}
                   />
                 </div>
                 <div hidden={tab !== "diff"}>
                   <ReviewPanel
                     taskId={active.id}
+                    canReview={active.can_review !== false}
+                    {storagePrefix}
                     visible={tab === "diff"}
                     initialPath={reviewPath}
                     requestKey={reviewRequest}
@@ -1707,6 +1908,10 @@
                   />
                 </div>
               {/key}
+              {#if tab === "team" && home?.shared}<TeamActivity
+                  taskId={active.id}
+                  version={active.version}
+                />{/if}
               {#if tab === "activity"}
                 {#if progress?.engine === "v2"}
                   {#key active.id}
@@ -1719,6 +1924,7 @@
                       onfile={openReview}
                       onreview={() => openReview()}
                       ontrace={openTrace}
+                      debugAvailable={!home?.shared}
                       onchecks={() => selectTab("checks")}
                     />
                   {/key}
@@ -1784,9 +1990,10 @@
                         <button onclick={() => (view = "settings")}
                           ><Settings2 size={14} /> Provider settings</button
                         >
-                        <button onclick={() => selectTab("debug")}
-                          ><Activity size={14} /> Harness details</button
-                        >
+                        {#if !home?.shared}<button
+                            onclick={() => selectTab("debug")}
+                            ><Activity size={14} /> Harness details</button
+                          >{/if}
                         <button class="primary" onclick={continueTask}
                           >Continue <ArrowRight size={14} /></button
                         >
@@ -1965,7 +2172,9 @@
                             <div class="entry-meta">
                               <strong
                                 >{entry.role === "you"
-                                  ? "You"
+                                  ? home?.shared
+                                    ? "Team member"
+                                    : "You"
                                   : entry.role === "agent"
                                     ? "boltzmann"
                                     : entry.role === "implementer"
@@ -2201,11 +2410,16 @@
   </div>
 {/if}
 
-<RepositoryDialog
-  bind:this={repositoryDialog}
-  projects={workspaceProjects}
-  onconnect={repositoryConnected}
-/>
+{#if authReady && !locked}
+  <RepositoryDialog
+    bind:this={repositoryDialog}
+    projects={workspaceProjects}
+    shared={!!home?.shared}
+    onconnect={repositoryConnected}
+  />
+
+  <ProjectMembers bind:this={memberDialog} />
+{/if}
 
 <dialog
   class="delete-dialog"
@@ -2219,14 +2433,15 @@
     repositoryToRemove = null;
   }}
 >
-  <h2 id="remove-repository-title">Remove repository?</h2>
+  <h2 id="remove-repository-title">Hide repository?</h2>
   <p class="delete-task-name">{repositoryToRemove?.name}</p>
   <p id="remove-repository-description">
-    This hides the repository and its tasks from boltzmann. Your files, task
-    history, and sandboxes are kept. Running tasks keep running.
+    This hides the repository and its tasks from your sidebar. Your teammates
+    keep their access. Files, task history, and sandboxes are kept. Running
+    tasks keep running.
   </p>
   <p class="delete-note">
-    Add the same folder again to restore its task history.
+    Use Hidden repositories in Settings to show it again.
   </p>
   {#if active?.project_id === repositoryToRemove?.id && fileText !== originalText}
     <p class="delete-note">
@@ -2246,9 +2461,7 @@
       disabled={removingRepository}
       onclick={removeRepository}
     >
-      <Trash2 size={14} />{removingRepository
-        ? "Removing…"
-        : "Remove repository"}
+      <Trash2 size={14} />{removingRepository ? "Hiding…" : "Hide repository"}
     </button>
   </div>
 </dialog>
